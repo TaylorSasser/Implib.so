@@ -153,12 +153,15 @@ Flags can be specified directly or via IMPLIBSO_LD_OPTIONS environment variable.
     sys.stderr.write(err)
     sys.exit(rc)
 
-  # Analyze ldd output to see which runtime libs were linked
-  # TODO: support BSD's ldd output format
-  rc, out, err = run(f'ldd {out_filename}')
+  # Analyze linked libraries
+  if sys.platform == 'darwin':
+    rc, out, err = run(f'otool -L {out_filename}')
+  else:
+    rc, out, err = run(f'ldd {out_filename}')
+
   os.unlink(out_filename)  # Remove output in case we fail later
   if rc != 0:
-    error(f"ldd failed: {err}")
+    error(f"dependency check failed: {err}")
   sys.stderr.write(err)
 
   class WrapperInfo:
@@ -174,16 +177,22 @@ Flags can be specified directly or via IMPLIBSO_LD_OPTIONS environment variable.
     l = l.strip()
     if not l:
       continue
-    if re.search(r'linux-vdso|ld-linux', l):
+    if re.search(r'linux-vdso|ld-linux|/usr/lib/libSystem|/usr/lib/libc\+\+', l):
       if v > 0:
         note(f"skipping system library: {l}")
       continue
-    m = re.search(r'^lib(\S*)\.so(\.[0-9]+)? => (\S*)', l)
+    
+    # Linux: libfoo.so.1 => /path/to/libfoo.so.1 (0x...)
+    # Mac: /path/to/libfoo.dylib (compatibility...)
+    m = re.search(r'^(?:lib)?(\S*?)\.(?:so|dylib)(?:\.[0-9]+)?(?: => )?(\S*)', l)
     if m is None:
-      warn(f"failed to parse ldd output: {l}")
+      if not l.endswith(':'): # Skip first line of otool
+        warn(f"failed to parse dependency output: {l}")
       continue
+    
     name = m.group(1)
-    path = m.group(3)
+    path = m.group(2) or m.group(0).split(' ')[0]
+    
     if is_system_library(name):
       if v > 0:
         note(f"skipping system library: {l}")
@@ -217,7 +226,7 @@ Flags can be specified directly or via IMPLIBSO_LD_OPTIONS environment variable.
         o += '.o'
         if v > 0:
           note(f"compiling wrapper for {f} in {o}")
-        rc, out, err = run(f'gcc -Wall -Wextra -O2 -c -o {o} {f}')
+        rc, out, err = run(f'cc -Wall -Wextra -O2 -c -o {o} {f}')
         if rc != 0:
           error(f"implib-gen failed: {err}")
         sys.stderr.write(err)

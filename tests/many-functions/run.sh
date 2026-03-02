@@ -28,4 +28,4 @@ ${PYTHON:-} ../../implib-gen.py -q --target $TARGET libtest.so
 
 $CC $CFLAGS libtest.so.* main.c $LIBS
 
-LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} $INTERP ./a.out
+LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-} $INTERP ./a.out

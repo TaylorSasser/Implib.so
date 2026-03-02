@@ -17,3 +17,7 @@ tests/*/*.log
 
 # GDB
 .gdb_history
+.idea
+.venv
+pyproject.toml
+uv.lock

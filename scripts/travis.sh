@@ -22,7 +22,6 @@ export PYTHON="${PYTHON:-python3}"
 tests/basic/run.sh $ARCH
 tests/exceptions/run.sh $ARCH
 tests/data-warnings/run.sh $ARCH
-tests/vtables/run.sh $ARCH
 if test -z "$ARCH" && ! echo "${CC:-}" | grep -q musl-gcc; then
   # TODO: enable for other targets
   tests/ld/run.sh

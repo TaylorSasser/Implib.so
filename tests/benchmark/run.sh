@@ -24,38 +24,33 @@ fi
 CFLAGS="-g -O2 $CFLAGS"
 N=10
 
-# Need sudo for nice...
-RUN='nice -n -20 taskset 1'
+RUN='sudo nice -n -20 taskset 1'
 
 $CC $CFLAGS -shared -fPIC interposed.c -o libinterposed.so
 ${PYTHON:-} ../../implib-gen.py -q --target $TARGET libinterposed.so
 
-export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-}
 
 # Baseline
-
 $CC $CFLAGS -DBASELINE main.c
 
 echo "Baseline:"
 $RUN time ./a.out
 
 # Normal
-
-$CC $CFLAGS main.c -L. -linterposed $LIBS
+$CC $CFLAGS main.c -L. -linterposed -Wl,-rpath,. $LIBS
 
 echo "Normal:"
 $RUN time ./a.out
 
 # Implib
-
-$CC $CFLAGS main.c libinterposed.so.tramp.S libinterposed.so.init.c $LIBS
+$CC $CFLAGS main.c libinterposed.so.tramp.S libinterposed.so.init.c -Wl,-rpath,. $LIBS
 
 echo "Implib:"
 $RUN time ./a.out
 
 # Implib (IMPLIB_EXPORT_SHIMS)
-
-$CC $CFLAGS -DIMPLIB_EXPORT_SHIMS -rdynamic main.c libinterposed.so.tramp.S libinterposed.so.init.c $LIBS
+$CC $CFLAGS -DIMPLIB_EXPORT_SHIMS -rdynamic main.c libinterposed.so.tramp.S libinterposed.so.init.c -Wl,-rpath,. $LIBS
 
 echo "Implib (IMPLIB_EXPORT_SHIMS):"
 $RUN time ./a.out

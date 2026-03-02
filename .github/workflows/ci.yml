@@ -5,16 +5,17 @@ name: CI
 on:
   push:
     branches:
-    - master
+      - master
+      - add-osx-support
     paths-ignore:
-    - 'LICENSE.txt'
-    - '**.md'
-    - 'specs/**'
+      - 'LICENSE.txt'
+      - '**.md'
+      - 'specs/**'
   pull_request:
     paths-ignore:
-    - 'LICENSE.txt'
-    - '**.md'
-    - 'specs/**'
+      - 'LICENSE.txt'
+      - '**.md'
+      - 'specs/**'
 jobs:
   Baseline:
     strategy:
@@ -22,51 +23,62 @@ jobs:
       matrix:
         os: [ubuntu-20.04, ubuntu-22.04, ubuntu-latest]
         cc: [[gcc, g++], [clang, clang++]]
-        py: [python3.6, python3.7, python3]  # We need f-strings so 3.6+
+        py: ['3.6', '3.7', '3.10']
         exclude:
           - os: ubuntu-22.04
-            py: python3.6
+            py: '3.6'
           - os: ubuntu-latest
-            py: python3.6
+            py: '3.6'
           - os: ubuntu-22.04
-            cc: [clang, clang++]  # Disable due to https://sourceware.org/bugzilla/show_bug.cgi?id=28981
+            cc: [clang, clang++]
           - os: ubuntu-latest
-            cc: [clang, clang++]  # Ditto
+            cc: [clang, clang++]
     runs-on: ${{ matrix.os }}
     env:
       CC: ${{ matrix.cc[0] }}
       CXX: ${{ matrix.cc[1] }}
-      PYTHON: ${{ matrix.py }}
+      PYTHON: python3
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: |
-        sudo add-apt-repository ppa:deadsnakes/ppa
-        sudo apt-get update
-        sudo apt-get install ${PYTHON}
-        sudo apt-get install ${PYTHON}-pip || true
-    - name: Run tests
-      run: scripts/travis.sh
-  PyPy:  # Can't test this in matrix, pypy package has different names in old distros
+      - uses: actions/checkout@v3
+      - name: Set up Python ${{ matrix.py }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.py }}
+      - name: Install deps
+        run: |
+          python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
+  PyPy:
     runs-on: ubuntu-latest
     env:
       PYTHON: pypy3
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get install ${PYTHON}
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Set up PyPy
+        uses: actions/setup-python@v4
+        with:
+          python-version: 'pypy3.9'
+      - name: Install deps
+        run: |
+          pypy3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   Pylint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get install pylint
-    - name: Run tests
-      run: |
-        pylint implib-gen.py
-        pylint scripts/ld
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get install pylint python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: |
+          pylint implib-gen.py
+          pylint scripts/ld
+
   Coverage:
     runs-on: ubuntu-latest
     environment: secrets
@@ -75,170 +87,214 @@ jobs:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
       PYTHON: 'coverage run -a'
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: |
-        sudo apt-get install python3 python3-pip
-        sudo python3 -mpip install codecov
-    - name: Run tests
-      run: scripts/travis.sh
-    - name: Upload coverage
-      run: |
-        for t in tests/*; do
-          if test -d $t -a -f $t/.coverage; then
-            (cd $t && coverage xml)
-          fi
-        done
-        codecov --required
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get install python3 python3-pip
+          sudo python3 -m pip install codecov lief
+      - name: Run tests
+        run: scripts/travis.sh
+      - name: Upload coverage
+        run: |
+          for t in tests/*; do
+            if test -d $t -a -f $t/.coverage; then
+              (cd $t && coverage xml)
+            fi
+          done
+          codecov --required
+
   avx:
     runs-on: ubuntu-latest
     env:
       CFLAGS: -mavx
     steps:
-    - uses: actions/checkout@v3
-    - name: Run tests
-      run: scripts/travis.sh
-#  avx2:
-#    runs-on: ubuntu-latest
-#    env:
-#      CFLAGS: -mavx2 -mavx512f
-#    steps:
-#    - uses: actions/checkout@v3
-#    - name: Run tests
-#      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get install python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
   musl:
     runs-on: ubuntu-latest
     env:
       CC: musl-gcc
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install musl-tools
-    - name: Run tests
-      run: scripts/travis.sh
-  # TODO: test on llvm-libc when it supports dlfcn
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install musl-tools python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
   x86:
     runs-on: ubuntu-latest
     env:
       ARCH: i386-linux-gnueabi
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install gcc-multilib g++-multilib
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install gcc-multilib g++-multilib python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   arm-arm:
     runs-on: ubuntu-latest
     env:
       ARCH: arm-linux-gnueabi
       CFLAGS: -marm
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-arm-linux-gnueabi g++-arm-linux-gnueabi binutils-arm-linux-gnueabi libc6-armel-cross libc6-dev-armel-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-arm-linux-gnueabi g++-arm-linux-gnueabi binutils-arm-linux-gnueabi libc6-armel-cross libc6-dev-armel-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   arm-thumb:
     runs-on: ubuntu-latest
     env:
       ARCH: arm-linux-gnueabi
       CFLAGS: -mthumb
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-arm-linux-gnueabi g++-arm-linux-gnueabi binutils-arm-linux-gnueabi libc6-armel-cross libc6-dev-armel-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-arm-linux-gnueabi g++-arm-linux-gnueabi binutils-arm-linux-gnueabi libc6-armel-cross libc6-dev-armel-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   armhf-arm:
     runs-on: ubuntu-latest
     env:
       ARCH: arm-linux-gnueabihf
       CFLAGS: -marm
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf binutils-arm-linux-gnueabihf libc6-armhf-cross libc6-dev-armhf-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf binutils-arm-linux-gnueabihf libc6-armhf-cross libc6-dev-armhf-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   armhf-thumb:
     runs-on: ubuntu-latest
     env:
       ARCH: arm-linux-gnueabihf
       CFLAGS: -mthumb
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf binutils-arm-linux-gnueabihf libc6-armhf-cross libc6-dev-armhf-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf binutils-arm-linux-gnueabihf libc6-armhf-cross libc6-dev-armhf-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   aarch64:
     runs-on: ubuntu-latest
     env:
       ARCH: aarch64-linux-gnueabi
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-arm64-cross libc6-dev-arm64-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-arm64-cross libc6-dev-arm64-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   mipsel:
     runs-on: ubuntu-latest
     env:
       ARCH: mipsel-linux-gnu
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-mipsel-linux-gnu g++-mipsel-linux-gnu binutils-mipsel-linux-gnu libc6-mipsel-cross libc6-dev-mipsel-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-mipsel-linux-gnu g++-mipsel-linux-gnu binutils-mipsel-linux-gnu libc6-mipsel-cross libc6-dev-mipsel-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   mips64el:
     runs-on: ubuntu-latest
     env:
       ARCH: mips64el-linux-gnu
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-mips64el-linux-gnuabi64 g++-mips64el-linux-gnuabi64 binutils-mips64el-linux-gnuabi64 libc6-mips64el-cross libc6-dev-mips64el-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-mips64el-linux-gnuabi64 g++-mips64el-linux-gnuabi64 binutils-mips64el-linux-gnuabi64 libc6-mips64el-cross libc6-dev-mips64el-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   powerpc64:
     runs-on: ubuntu-latest
     env:
       ARCH: powerpc64-linux-gnu
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu binutils-powerpc64-linux-gnu libc6-ppc64-powerpc-cross libc6-dev-ppc64-powerpc-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu binutils-powerpc64-linux-gnu libc6-ppc64-powerpc-cross libc6-dev-ppc64-powerpc-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   powerpc64le:
     runs-on: ubuntu-latest
     env:
       ARCH: powerpc64le-linux-gnu
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-powerpc64le-linux-gnu g++-powerpc64le-linux-gnu binutils-powerpc64le-linux-gnu libc6-ppc64el-cross libc6-dev-ppc64el-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-powerpc64le-linux-gnu g++-powerpc64le-linux-gnu binutils-powerpc64le-linux-gnu libc6-ppc64el-cross libc6-dev-ppc64el-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   riscv64:
     runs-on: ubuntu-latest
     env:
       ARCH: riscv64-linux-gnu
     steps:
-    - uses: actions/checkout@v3
-    - name: Install deps
-      run: sudo apt-get update && sudo apt-get install qemu-user gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu libc6-riscv64-cross libc6-dev-riscv64-cross
-    - name: Run tests
-      run: scripts/travis.sh
+      - uses: actions/checkout@v3
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install qemu-user gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu libc6-riscv64-cross libc6-dev-riscv64-cross python3-pip
+          sudo python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh
+
   freebsd:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: vmactions/freebsd-vm@v1
-      with:
-        usesh: true
-        copyback: false
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          copyback: false
+          run: |
+            scripts/install-freebsd-prereqs.sh
+            python3 -m ensurepip || true
+            python3 -m pip install lief
+            scripts/travis.sh
+
+  osx:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install deps
         run: |
-          scripts/install-freebsd-prereqs.sh
-          scripts/travis.sh
+          brew install python3
+          python3 -m pip install lief --break-system-packages || python3 -m pip install lief
+      - name: Run tests
+        run: scripts/travis.sh

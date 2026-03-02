@@ -35,7 +35,7 @@ ${PYTHON:-} ../../implib-gen.py -q --target $TARGET --no-dlopen libinterposed.so
 # Build app
 $CC $CFLAGS -fPIE main.c libinterposed.so.tramp.S libinterposed.so.init.c $LIBS
 
-LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} $INTERP ./a.out > a.out.log
+LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-} $INTERP ./a.out > a.out.log
 diff test.ref a.out.log
 
 echo SUCCESS

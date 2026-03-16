@@ -1,4 +1,3 @@
-# implibgen/cli.py
 import argparse
 import configparser
 import os
@@ -18,7 +17,6 @@ def detect_platform_default() -> str:
 
 
 def normalize_arch(raw: str) -> str:
-    # macOS common arch string
     if raw == "arm64":
         return "aarch64"
     if raw.startswith("arm"):
@@ -31,7 +29,7 @@ def normalize_arch(raw: str) -> str:
 
 
 def resolve_repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent  # assumes implibgen/ is in repo root
+    return Path(__file__).resolve().parent.parent  # assumes implib/ is in repo root
 
 
 def load_arch_config(platform_root: Path, arch: str) -> tuple[int, set[str]]:
@@ -56,12 +54,20 @@ def parse_symbol_list(path: Optional[str]) -> Optional[list[str]]:
                 out.append(line)
     return out
 
-def pick_backend(path: str):
-    backends = [ElfBackend(), MachOBackend()]
-    for b in backends:
-        if b.matches(path):
-            return b
-    die(f"unrecognized binary format for '{path}' (not ELF, not Mach-O)")
+
+def pick_backend(path: str, platform: str):
+    # Try platform-specific backends first
+    if platform == "osx":
+        m = MachOBackend()
+        if m.matches(path): return m
+    
+    # ElfBackend now handles .def files as well
+    e = ElfBackend()
+    if e.matches(path): return e
+    
+    # Final fallback
+    return MachOBackend() if platform == "osx" else ElfBackend()
+
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser()
@@ -90,14 +96,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     info = info_printer(args.quiet)
 
     platform = args.platform or detect_platform_default()
+    backend = pick_backend(args.library, platform)
+
     repo_root = resolve_repo_root()
     platform_root = repo_root / "arch" / platform
     arch = normalize_arch(args.target)
+    backend.set_arch(arch)
     ptr_size, _relocs = load_arch_config(platform_root, arch)
 
-    backend = pick_backend(args.library)
-
     stem = Path(args.library).name
+    if stem.lower().endswith(".def"):
+        stem = stem[:-4]
     load_name = args.library_load_name or backend.default_load_name(args.library)
 
     templates_dir = platform_root / arch

@@ -19,7 +19,7 @@ fi
 
 . ../common.sh
 
-export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-}
 
 $CC $CFLAGS -shared -fPIC interposed.c -o libinterposed.so
 ${PYTHON:-} ../../implib-gen.py -q --target $TARGET libinterposed.so
@@ -27,14 +27,26 @@ ${PYTHON:-} ../../implib-gen.py -q --target $TARGET libinterposed.so
 $CC $CFLAGS -shared -fPIC user.c libinterposed.so.tramp.S libinterposed.so.init.c -o libuser.so
 $CC $CFLAGS -shared -fPIC user.c libinterposed.so.tramp.S libinterposed.so.init.c -DIMPLIB_EXPORT_SHIMS -o libuser_export_shims.so
 
-if test $(readelf -D -sW libuser_export_shims.so | grep foo | wc -l) -eq 0; then
-  echo "Shim symbol NOT exported by default" >&2
-  exit 1
-fi
-
-if test $(readelf -D -sW libuser.so | grep foo | wc -l) -gt 0; then
-  echo "Hidden shim symbol exported" >&2
-  exit 1
+if uname | grep -q Darwin; then
+  # On Mac, check for _foo in exported symbols (nm -g)
+  if ! nm -g libuser_export_shims.so | grep -q _foo; then
+    echo "Shim symbol NOT exported" >&2
+    exit 1
+  fi
+  if nm -g libuser.so | grep -q _foo; then
+    echo "Hidden shim symbol exported" >&2
+    exit 1
+  fi
+else
+  # On Linux, use readelf
+  if test $(readelf -D -sW libuser_export_shims.so | grep foo | wc -l) -eq 0; then
+    echo "Shim symbol NOT exported by default" >&2
+    exit 1
+  fi
+  if test $(readelf -D -sW libuser.so | grep foo | wc -l) -gt 0; then
+    echo "Hidden shim symbol exported" >&2
+    exit 1
+  fi
 fi
 
 echo SUCCESS

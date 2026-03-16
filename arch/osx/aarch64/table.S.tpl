@@ -10,32 +10,22 @@
 #define lr x30
 #define ip0 x16
 
-  .section .note.GNU-stack,"",@progbits
-
-  .data
-
-  .globl _${lib_suffix}_tramp_table
-  .hidden _${lib_suffix}_tramp_table
-  .align 8
-_${lib_suffix}_tramp_table:
+.data
+  .globl __${lib_suffix}_tramp_table
+  .private_extern __${lib_suffix}_tramp_table
+  .p2align 3
+__${lib_suffix}_tramp_table:
   .zero $table_size
 
   .text
 
-  .globl _${lib_suffix}_tramp_resolve
-  .hidden _${lib_suffix}_tramp_resolve
+  .globl __${lib_suffix}_tramp_resolve
+  .private_extern __${lib_suffix}_tramp_resolve
 
-  .globl _${lib_suffix}_save_regs_and_resolve
-  .hidden _${lib_suffix}_save_regs_and_resolve
-  .type _${lib_suffix}_save_regs_and_resolve, %function
-_${lib_suffix}_save_regs_and_resolve:
+  .globl __${lib_suffix}_save_regs_and_resolve
+  .private_extern __${lib_suffix}_save_regs_and_resolve
+__${lib_suffix}_save_regs_and_resolve:
   .cfi_startproc
-
-  // Slow path which calls dlsym, taken only on first call.
-  // Registers are saved according to "Procedure Call Standard for the Arm® 64-bit Architecture".
-  // For DWARF directives, read https://www.imperialviolet.org/2017/01/18/cfi.html.
-
-  // Stack is aligned at 16 bytes
 
 #define PUSH_PAIR(reg1, reg2) stp reg1, reg2, [sp, #-16]!; .cfi_adjust_cfa_offset 16; .cfi_rel_offset reg1, 0; .cfi_rel_offset reg2, 8
 #define POP_PAIR(reg1, reg2) ldp reg1, reg2, [sp], #16; .cfi_adjust_cfa_offset -16; .cfi_restore reg2; .cfi_restore reg1
@@ -58,11 +48,8 @@ _${lib_suffix}_save_regs_and_resolve:
   PUSH_WIDE_PAIR(q6, q7)
 
   // Stack is aligned at 16 bytes
-
-  bl _${lib_suffix}_tramp_resolve
+  bl __${lib_suffix}_tramp_resolve
   mov ip0, x0
-
-  // TODO: pop pc?
 
   POP_WIDE_PAIR(q6, q7)
   POP_WIDE_PAIR(q4, q5)
@@ -78,4 +65,3 @@ _${lib_suffix}_save_regs_and_resolve:
   br lr
 
   .cfi_endproc
-

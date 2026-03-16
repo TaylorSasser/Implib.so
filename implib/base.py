@@ -1,4 +1,3 @@
-# implibgen/backends/base.py
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional, Sequence
@@ -9,6 +8,16 @@ class BackendError(RuntimeError):
     pass
 
 class BinaryBackend(ABC):
+    def __init__(self):
+        self.arch: Optional[str] = None
+
+    def set_arch(self, arch: str) -> None:
+        self.arch = arch
+
+    @abstractmethod
+    def read_data(self, path: str, address: int, size: int) -> bytes:
+        ...
+
     @property
     @abstractmethod
     def format_name(self) -> str:

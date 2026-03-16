@@ -20,6 +20,10 @@ if test $ARCH = $(uname -m); then
   TARGET=$ARCH
   PREFIX=
   INTERP=
+  if uname | grep -q Darwin; then
+    # On Mac, LD_LIBRARY_PATH is DYLD_LIBRARY_PATH
+    export DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-}
+  fi
 else
   # Simulate
   # (see .github/workflows/ci.yml for list of needed packages)

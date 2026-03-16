@@ -7,21 +7,19 @@
  * found in the LICENSE.txt file.
  */
 
-  .globl $sym
+  .globl _$sym
   .p2align 4
-  .type $sym, %function
 #ifndef IMPLIB_EXPORT_SHIMS
-  .hidden $sym
+  .private_extern _$sym
 #endif
-$sym:
+_$sym:
   .cfi_startproc
 
 1:
-  // Load address
-  // TODO: can we do this faster on newer ARMs?
-  adrp ip0, _${lib_suffix}_tramp_table+$offset
-  ldr ip0, [ip0, #:lo12:_${lib_suffix}_tramp_table+$offset]
- 
+  // Load address via Mach-O PAGE/PAGEOFF directives
+  adrp ip0, (__${lib_suffix}_tramp_table + $offset)@PAGE
+  ldr ip0, [ip0, (__${lib_suffix}_tramp_table + $offset)@PAGEOFF]
+
   cbz ip0, 2f
 
   // Fast path
@@ -29,13 +27,16 @@ $sym:
 
 2:
   // Slow path
-  mov ip0, $number & 0xffff
+  mov ip0, #($number & 0xffff)
 #if $number > 0xffff
-  movk ip0, $number >> 16, lsl #16
+  movk ip0, #($number >> 16), lsl #16
 #endif
-  stp ip0, lr, [sp, #-16]!; .cfi_adjust_cfa_offset 16; .cfi_rel_offset lr, 8
-  bl _${lib_suffix}_save_regs_and_resolve
-  ldp xzr, lr, [sp], #16; .cfi_adjust_cfa_offset -16; .cfi_restore lr
+  stp ip0, lr, [sp, #-16]!
+  .cfi_adjust_cfa_offset 16
+  .cfi_rel_offset lr, 8
+  bl __${lib_suffix}_save_regs_and_resolve
+  ldp xzr, lr, [sp], #16
+  .cfi_adjust_cfa_offset -16
+  .cfi_restore lr
   br ip0
   .cfi_endproc
-

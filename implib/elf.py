@@ -1,276 +1,176 @@
-# implibgen/backends/elf.py
 from __future__ import annotations
 import os
-import sys
+import bisect
+import lief
 
-from implib.base import BinaryBackend, BackendError
-from implib.model import Symbol, SectionInfo, RelocationInfo
-from implib.log import warn, error
-
+from implib.base import BinaryBackend, MAGIC_ELF, Symbol, SectionInfo, RelocationInfo
+from implib.log import error
 
 class ElfBackend(BinaryBackend):
     format_name = "elf"
 
-    def matches(self, path: str) -> bool:
-        try:
-            with open(path, "rb") as f:
-                return f.read(4) == b"\x7fELF"
-        except OSError:
-            return False
+    @property
+    def default_platform(self) -> str:
+        return "linux"
 
-    def _require_lief(self):
-        try:
-            import lief  # noqa: F401
-        except ImportError as e:
-            error(f"LIEF is required for ELF parsing but not installed. Error: {e!r}")
+    def matches(self) -> bool:
+        if self.is_def:
+            return True
+        return self.magic == MAGIC_ELF
 
-    def collect_symbols(self, path: str) -> list[Symbol]:
-        self._require_lief()
-        import lief
+    def collect_symbols(self) -> list[Symbol]:
+        if self.binary is None:
+            return self._collect_def_symbols()
+        elf: lief.ELF.Binary = self.binary
 
-        try:
-            bin_ = lief.parse(path)
-        except Exception:
-            bin_ = None
+        all_addrs = sorted({sym.value for sym in elf.symbols if sym.value != 0})
+        sections = sorted([(s.virtual_address, s.virtual_address + s.size) for s in elf.sections], key=lambda x: x[0])
+        sec_starts = [x[0] for x in sections]
 
-        if bin_ is None or not isinstance(bin_, lief.ELF.Binary):
-            error(f"failed to analyze symbols in {path}")
-            return []
+        def get_exact_size(sym: lief.ELF.Symbol) -> int:
+            if sym.size > 0 or not sym.value: return sym.size
+            idx = bisect.bisect_right(all_addrs, sym.value)
+            next_sym_addr = all_addrs[idx] if idx < len(all_addrs) else None
+            
+            sec_end = 0
+            s_idx = bisect.bisect_right(sec_starts, sym.value) - 1
+            if s_idx >= 0:
+                _, end = sections[s_idx]
+                if sym.value < end: sec_end = end
+            
+            limit = next_sym_addr if next_sym_addr and next_sym_addr < sec_end else sec_end
+            if limit and limit > sym.value:
+                return limit - sym.value
+            return 0
+
+        def _get_score(s: Symbol) -> int:
+            score = 0
+            if s.ndx != "UND": score += 8
+            if s.typ != "NOTYPE": score += 4
+            if s.size > 0: score += 2
+            if s.value != 0: score += 1
+            return score
 
         by_name: dict[str, Symbol] = {}
         order: list[str] = []
 
-        def _score(sym: Symbol) -> tuple[int, int, int, int]:
-            defined = 1 if sym.ndx != "UND" else 0
-            typed = 1 if sym.typ != "NOTYPE" else 0
-            sized = 1 if sym.size and sym.size > 0 else 0
-            valued = 1 if sym.value and sym.value != 0 else 0
-            return (defined, typed, sized, valued)
+        for sym in elf.exported_symbols:
+            if not sym.name: continue
 
-        def _merge(existing: Symbol, new: Symbol, *, new_from_dynsym: bool) -> None:
-            if _score(new) > _score(existing):
-                existing.bind = new.bind
-                existing.typ = new.typ
-                existing.ndx = new.ndx
-                existing.value = new.value
-                existing.size = new.size
+            if sym.imported or sym.shndx == 0: ndx = "UND"
+            elif sym.shndx == 0xFFF1: ndx = "ABS"
+            elif sym.shndx == 0xFFF2: ndx = "COM"
+            else: ndx = str(sym.shndx)
+
+            ver_name, default = None, True
+            if sym.has_version:
+                ver = sym.symbol_version
+                if ver:
+                    default = not (ver.value & 0x8000)
+                    if ver.symbol_version_auxiliary:
+                        ver_name = ver.symbol_version_auxiliary.name
+
+            if sym.visibility == lief.ELF.Symbol.VISIBILITY.HIDDEN:
+                default = False
+
+            s_obj = Symbol(
+                name=sym.name,
+                bind=sym.binding.name,
+                typ=sym.type.name,
+                ndx=ndx,
+                value=sym.value,
+                size=get_exact_size(sym),
+                default=default,
+                version=ver_name,
+                demangled=sym.demangled_name or sym.name
+            )
+
+            if sym.name not in by_name:
+                by_name[sym.name] = s_obj
+                order.append(sym.name)
             else:
-                if existing.typ == "NOTYPE" and new.typ != "NOTYPE":
-                    existing.typ = new.typ
-                if existing.ndx == "UND" and new.ndx != "UND":
-                    existing.ndx = new.ndx
-                if existing.size == 0 and new.size:
-                    existing.size = new.size
-                if existing.value == 0 and new.value:
-                    existing.value = new.value
-                if existing.bind == "LOCAL" and new.bind != "LOCAL":
-                    existing.bind = new.bind
-            if new_from_dynsym:
-                existing.version = new.version
-                existing.default = new.default
-            else:
-                if existing.version is None and new.version is not None:
-                    existing.version = new.version
-                    existing.default = new.default
-
-        static_syms = getattr(bin_, "static_symbols", [])
-        if not static_syms:
-            static_syms = getattr(bin_, "symbols", [])
-        dynamic_syms = getattr(bin_, "dynamic_symbols", [])
-
-        for is_dyn, syms in [(False, static_syms), (True, dynamic_syms)]:
-            for sym in syms:
-                name = sym.name
-                if not name:
-                    continue
-
-                bind = str(sym.binding).split(".")[-1]
-                typ = str(sym.type).split(".")[-1]
-
-                if sym.shndx == lief.ELF.SYMBOL_SECTION_INDEX.UNDEF:
-                    ndx = "UND"
-                else:
-                    ndx = str(sym.shndx)
-
-                ver_name = None
-                default = True
-
-                if is_dyn and sym.has_version:
-                    sym_ver = sym.symbol_version
-                    if sym_ver and sym_ver.has_auxiliary_version:
-                        ver_name = sym_ver.symbol_version_auxiliary.name
-                    if sym_ver and (sym_ver.value & 0x8000):
-                        default = False
-
-                vis = str(sym.visibility).split(".")[-1]
-                if vis == "HIDDEN":
-                    default = False
-
-                sym_obj = Symbol(
-                    name=name,
-                    bind=bind,
-                    typ=typ,
-                    ndx=ndx,
-                    value=sym.value,
-                    size=sym.size,
-                    default=default,
-                    version=ver_name,
-                )
-
-                if name not in by_name:
-                    by_name[name] = sym_obj
-                    order.append(name)
-                else:
-                    _merge(by_name[name], sym_obj, new_from_dynsym=is_dyn)
+                existing = by_name[sym.name]
+                new_score = _get_score(s_obj)
+                old_score = _get_score(existing)
+                
+                if (new_score > old_score) or (existing.version is None and s_obj.version is not None):
+                    if s_obj.version is None:
+                        s_obj.version, s_obj.default = existing.version, existing.default
+                    by_name[sym.name] = s_obj
+                elif s_obj.version is not None and existing.version is not None:
+                    if s_obj.default and not existing.default:
+                        by_name[sym.name] = s_obj
 
         out = [by_name[n] for n in order]
-        if not out:
-            error(f"failed to analyze symbols in {path}")
+        if not out: error(f"failed to analyze symbols in {self.path}")
         return out
 
-    def default_load_name(self, path: str) -> str:
-        self._require_lief()
-        import lief
-        try:
-            bin_ = lief.parse(path)
-            if bin_ and isinstance(bin_, lief.ELF.Binary):
-                for entry in bin_.dynamic_entries:
-                    if getattr(entry, "tag", None) == lief.ELF.DYNAMIC_TAGS.SONAME:
-                        return getattr(entry, "name", os.path.basename(path))
-        except Exception:
-            pass
-        return os.path.basename(path)
+    def default_load_name(self) -> str:
+        if self.binary is None:
+            return self._read_def_library_name() or os.path.basename(self.path)
+
+        for entry in self.binary.dynamic_entries:
+            if int(entry.tag) == 14:
+                return entry.name
+        return os.path.basename(self.path)
 
     def supports_vtables(self) -> bool:
         return True
 
-    def collect_sections(self, path: str) -> list[SectionInfo]:
-        self._require_lief()
-        import lief
-        secs: list[SectionInfo] = []
-        try:
-            bin_ = lief.parse(path)
-            if not bin_ or not isinstance(bin_, lief.ELF.Binary):
-                error(f"failed to analyze sections in {path}")
-                return secs
+    def collect_sections(self) -> list[SectionInfo]:
+        if not self.binary: return []
+        return [
+            SectionInfo(s.name, s.virtual_address, s.offset, s.size, "ALLOC")
+            for s in self.binary.sections if s.has(lief.ELF.Section.FLAGS.ALLOC)
+        ]
 
-            for sec in bin_.sections:
-                if sec.has(lief.ELF.SECTION_FLAGS.ALLOC):
-                    secs.append(SectionInfo(
-                        name=sec.name,
-                        address=sec.virtual_address,
-                        offset=sec.offset,
-                        size=sec.size,
-                        flags="ALLOC"
-                    ))
-        except Exception:
-            error(f"failed to analyze sections in {path}")
-        return secs
+    def collect_relocations(self) -> list[RelocationInfo]:
+        if not self.binary:
+            return []
+        elf: lief.ELF.Binary = self.binary
 
-    def collect_relocations(self, path: str) -> list[RelocationInfo]:
-        self._require_lief()
-        import lief
+        addr_syms = sorted([(s.value, s.value + max(1, s.size), s.name)
+                            for s in elf.symbols if s.name and s.value != 0 and not s.name.startswith(".")],
+                           key=lambda t: t[0])
+        starts = [t[0] for t in addr_syms]
+
+        def resolve_addr(addr: int) -> tuple[str, int] | None:
+            if not addr_syms: return None
+            idx = bisect.bisect_right(starts, addr) - 1
+            if idx >= 0:
+                start, end, name = addr_syms[idx]
+                if addr < end or addr - start <= 0x100000:
+                    return name, addr - start
+            return None
 
         rels: list[RelocationInfo] = []
-        try:
-            bin_ = lief.parse(path)
-            if not bin_ or not isinstance(bin_, lief.ELF.Binary):
-                error(f"failed to analyze relocations in {path}")
-                return rels
+        for rel in elf.relocations:
+            rel_type_name = f"R_{rel.type.name}"
+            if elf.header.machine_type == lief.ELF.ARCH.I386:
+                rel_type_name = rel_type_name.replace("R_X86_", "R_386_")
+            try:
+                target_addr = rel.resolve()
+            except Exception:
+                target_addr = rel.addend + (rel.symbol.value if rel.has_symbol else 0)
 
-            addr_syms: list[tuple[int, int, str]] = []
-            for sym in getattr(bin_, "symbols", []):
-                if sym.name and sym.value != 0:
-                    sz = sym.size
-                    end = sym.value + sz if sz > 0 else sym.value
-                    addr_syms.append((sym.value, end, sym.name))
-            addr_syms.sort(key=lambda t: t[0])
+            sym_name = ""
+            addend = 0
+            
+            if rel.has_symbol and rel.symbol.name and not rel.symbol.name.startswith("."):
+                sym_name = rel.symbol.name
+                addend = target_addr - rel.symbol.value
+            else:
+                got = resolve_addr(target_addr)
+                if got:
+                    sym_name, addend = got
+                else:
+                    addend = target_addr
 
-            def resolve_addr(addr: int) -> tuple[str, int] | None:
-                if not addr_syms: return None
-                for start, end, name in addr_syms:
-                    if end > start and start <= addr < end: return name, addr - start
-                    if end == start and addr == start: return name, 0
-                best = None
-                for start, _end, name in addr_syms:
-                    if start <= addr:
-                        best = (name, addr - start)
-                    else:
-                        break
-                if best is None: return None
-                name, delta = best
-                if delta > 0x100000: return None
-                return name, delta
+            rels.append(RelocationInfo(rel.address, rel.info, rel_type_name, (sym_name, addend)))
 
-            byteorder = "little" if bin_.header.identity_data == lief.ELF.ELF_DATA.LSB else "big"
-            ptr_size = 8 if bin_.header.identity_class == lief.ELF.ELF_CLASS.CLASS64 else 4
-
-            with open(path, "rb") as fh:
-                for rel in getattr(bin_, "relocations", []):
-                    r_offset = rel.address
-                    r_info = getattr(rel, 'info', 0)
-
-                    m_type = bin_.header.machine_type
-                    type_val = rel.type
-                    rel_type_name = str(type_val).split(".")[-1]
-
-                    if not rel_type_name.startswith("R_"):
-                        if m_type == lief.ELF.ARCH.x86_64:
-                            rel_type_name = "R_X86_64_" + rel_type_name
-                        elif m_type == lief.ELF.ARCH.i386:
-                            rel_type_name = "R_386_" + rel_type_name
-                        elif m_type == lief.ELF.ARCH.AARCH64:
-                            rel_type_name = "R_AARCH64_" + rel_type_name
-                        elif m_type == lief.ELF.ARCH.ARM:
-                            rel_type_name = "R_ARM_" + rel_type_name
-                        elif m_type == lief.ELF.ARCH.PPC64:
-                            rel_type_name = "R_PPC64_" + rel_type_name
-                        else:
-                            rel_type_name = "R_" + rel_type_name
-
-                    sym_name = rel.symbol.name if rel.has_symbol and rel.symbol and rel.symbol.name else ""
-                    addend = getattr(rel, 'addend', 0)
-
-                    if addend == 0 and getattr(rel, 'is_rela', False) == False:
-                        try:
-                            has_rela = bin_.has(lief.ELF.DYNAMIC_TAGS.RELA)
-                        except Exception:
-                            has_rela = False
-
-                        if not has_rela:
-                            try:
-                                raw = bin_.get_content_from_virtual_address(rel.address, ptr_size)
-                                if len(raw) == ptr_size:
-                                    val = int.from_bytes(bytes(raw), byteorder=byteorder, signed=False)
-                                    if val >= (1 << (ptr_size*8 - 1)):
-                                        val -= (1 << (ptr_size*8))
-                                    addend = val
-                            except Exception:
-                                pass
-
-                    if not sym_name and addend:
-                        got = resolve_addr(addend)
-                        if got is not None:
-                            sym_name, delta = got
-                            addend = delta
-
-                    rels.append(RelocationInfo(
-                        offset=r_offset,
-                        info=r_info,
-                        typ=rel_type_name,
-                        symbol_addend=(sym_name, addend)
-                    ))
-        except Exception:
-            error(f"failed to analyze relocations in {path}")
         return rels
 
-    def byteorder(self, path: str) -> str:
-        self._require_lief()
-        import lief
-        try:
-            bin_ = lief.parse(path)
-            if bin_ and isinstance(bin_, lief.ELF.Binary) and bin_.header.identity_data == lief.ELF.ELF_DATA.LSB:
-                return "little"
-        except Exception:
-            pass
-        return "big"
+    def byteorder(self) -> str:
+        if not self.binary:
+            return "little"
+        return "little" if self.binary.header.identity_data == lief.ELF.Header.ELF_DATA.LSB else "big"

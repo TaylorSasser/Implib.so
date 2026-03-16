@@ -23,6 +23,52 @@
 #include <stdio.h>
 #include <assert.h>
 
+#ifdef __APPLE__
+#include <pthread.h>
+
+#ifndef PTHREAD_BARRIER_SERIAL_THREAD
+#define PTHREAD_BARRIER_SERIAL_THREAD 1
+#endif
+
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  unsigned int count;
+  unsigned int tripCount;
+} pthread_barrier_t;
+
+static inline __attribute__((unused)) int pthread_barrier_init(pthread_barrier_t *barrier, const void *attr, unsigned int count) {
+  (void)attr;
+  if (count == 0) return -1;
+  if (pthread_mutex_init(&barrier->mutex, 0) < 0) return -1;
+  if (pthread_cond_init(&barrier->cond, 0) < 0) return -1;
+  barrier->tripCount = count;
+  barrier->count = 0;
+  return 0;
+}
+
+static inline __attribute__((unused)) int pthread_barrier_destroy(pthread_barrier_t *barrier) {
+  pthread_mutex_destroy(&barrier->mutex);
+  pthread_cond_destroy(&barrier->cond);
+  return 0;
+}
+
+static inline __attribute__((unused)) int pthread_barrier_wait(pthread_barrier_t *barrier) {
+  pthread_mutex_lock(&barrier->mutex);
+  ++(barrier->count);
+  if (barrier->count >= barrier->tripCount) {
+    barrier->count = 0;
+    pthread_cond_broadcast(&barrier->cond);
+    pthread_mutex_unlock(&barrier->mutex);
+    return PTHREAD_BARRIER_SERIAL_THREAD;
+  } else {
+    pthread_cond_wait(&barrier->cond, &barrier->mutex);
+    pthread_mutex_unlock(&barrier->mutex);
+    return 0;
+  }
+}
+#endif
+
 #if THREAD_SAFE
 #include <pthread.h>
 #endif
@@ -170,6 +216,7 @@ void *_${lib_suffix}_tramp_resolve(size_t i) {
   int publish = 1;
 
   void *h = 0;
+  int should_close_handle = 0;
 #if NO_DLOPEN
   // Library with implementations must have already been loaded.
   if (lib_handle) {
@@ -177,14 +224,24 @@ void *_${lib_suffix}_tramp_resolve(size_t i) {
     h = lib_handle;
   } else {
     // User hasn't provided us the loaded library so search the global namespace.
-#   ifndef IMPLIB_EXPORT_SHIMS
-    // If shim symbols are hidden we should search
-    // for first available definition of symbol in library list
-    h = RTLD_DEFAULT;
-#   else
-    // Otherwise look for next available definition
-    h = RTLD_NEXT;
+#   ifdef __APPLE__
+    // On macOS, RTLD_NEXT from main executable often fails to find libraries loaded via dlopen.
+    // Try to get handle to the target library if it's already loaded (honoring NO_DLOPEN).
+    // We use RTLD_NOLOAD which is available on macOS 10.10+.
+    // Note that RTLD_NOLOAD on macOS increments refcount, so we must dlclose it later.
+    h = dlopen("$load_name", RTLD_LAZY | RTLD_NOLOAD | RTLD_GLOBAL);
+    if (h) should_close_handle = 1;
 #   endif
+    if (!h) {
+#     ifndef IMPLIB_EXPORT_SHIMS
+      // If shim symbols are hidden we should search
+      // for first available definition of symbol in library list
+      h = RTLD_DEFAULT;
+#     else
+      // Otherwise look for next available definition
+      h = RTLD_NEXT;
+#     endif
+    }
   }
 #else
   publish = load_library();
@@ -200,8 +257,13 @@ void *_${lib_suffix}_tramp_resolve(size_t i) {
 #else
   // Dlsym is thread-safe so don't need to protect it.
   addr = dlsym(h, sym_names[i]);
-  CHECK(addr, "failed to resolve symbol '%s' via dlsym: %s", sym_names[i], dlerror());
 #endif
+
+  if (should_close_handle) {
+    dlclose(h);
+  }
+
+  CHECK(addr, "failed to resolve symbol '%s' via dlsym: %s", sym_names[i], dlerror());
 
   if (publish) {
     // Use atomic to please Tsan and ensure that preceeding writes

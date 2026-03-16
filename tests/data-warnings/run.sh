@@ -19,7 +19,7 @@ fi
 
 . ../common.sh
 
-export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-}
 
 $CC $CFLAGS -shared -fPIC interposed.c
 ${PYTHON:-} ../../implib-gen.py -q --target $TARGET a.out 2>err.log

@@ -1,154 +1,140 @@
 from __future__ import annotations
 import os
-
-from implib.base import BinaryBackend, BackendError
-from implib.model import Symbol, SectionInfo, RelocationInfo
+import bisect
+import lief
+from implib.base import BinaryBackend, MAGIC_MACHO, Symbol, SectionInfo, RelocationInfo
 from implib.log import error
-
-_MACHO_MAGICS = {
-    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
-    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
-    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
-    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
-}
 
 class MachOBackend(BinaryBackend):
     format_name = "macho"
-    def matches(self, path: str) -> bool:
-        try:
-            with open(path, "rb") as f:
-                return f.read(4) in _MACHO_MAGICS
-        except OSError:
-            return False
 
-    def _require_lief(self):
-        try:
-            import lief  # noqa: F401
-        except ImportError as e:
-            raise BackendError(
-                "LIEF is required for Mach-O parsing but not installed. "
-                "Install it (e.g., `uv add lief` or `pip install lief`)."
-            ) from e
+    def matches(self) -> bool:
+        return self.magic in MAGIC_MACHO
 
-    def _get_binary(self, path: str):
-        self._require_lief()
-        import lief
-
-        try:
-            bin_ = lief.parse(path)
-        except Exception:
-            bin_ = None
-
-        if bin_ is None:
-            raise BackendError(f"LIEF failed to parse Mach-O '{path}'")
-
-        if isinstance(bin_, lief.MachO.FatBinary):
-            bin_ = bin_.at(0)
-
-        return bin_
-
-    def collect_symbols(self, path: str) -> list[Symbol]:
-        try:
-            bin_ = self._get_binary(path)
-        except BackendError as e:
-            error(str(e))
+    def collect_symbols(self) -> list[Symbol]:
+        if not self.binary:
             return []
 
+        all_addrs = sorted({sym.value for sym in self.binary.symbols if sym.value != 0})
+        func_addrs = {f.address for f in self.binary.functions}
+        
+        sections_info = sorted([
+            (
+                sec.virtual_address, 
+                sec.virtual_address + sec.size, 
+                sec.name, 
+                sec.segment.name if sec.has_segment else ""
+            ) for sec in self.binary.sections
+        ], key=lambda x: x[0])
+        
+        sec_starts = [x[0] for x in sections_info]
+
+        def get_sec_info(val: int):
+            idx = bisect.bisect_right(sec_starts, val) - 1
+            if idx >= 0:
+                s_start, s_end, n, s = sections_info[idx]
+                if val < s_end:
+                    return s_end, n, s
+            return 0, "", ""
+
+        def get_exact_size(val: int, sec_end: int) -> int:
+            if not val: return 0
+            idx = bisect.bisect_right(all_addrs, val)
+            next_sym_addr = all_addrs[idx] if idx < len(all_addrs) else None
+            
+            if next_sym_addr and next_sym_addr < sec_end:
+                return next_sym_addr - val
+            return max(0, sec_end - val)
+
         out: list[Symbol] = []
+        for sym in self.binary.exported_symbols:
+            name = sym.name
+            if not name: continue
 
-        for sym in getattr(bin_, "exported_symbols", []):
-            name = getattr(sym, "name", "")
-            if not name:
-                continue
+            if name.startswith("_"):
+                name = name[1:]
 
-            out.append(Symbol(
-                name=name,
-                bind="GLOBAL",
-                typ="FUNC", # Mach-O doesn't explicitly type functions vs objects natively
-                ndx="0",    # Placeholder for defined (non-UNDEF)
-                value=getattr(sym, "value", 0),
-                size=0,     # Mach-O symbol tables don't store explicit sizes
-                default=True,
-            ))
+            val = sym.value
+            sec_end, sec_name, seg_name = get_sec_info(val)
+            size = get_exact_size(val, sec_end)
+            
+            typ = "OBJECT"
+            export_info = sym.export_info if sym.has_export_info else None
 
-        # Fallback to exported_functions just in case
+            if seg_name in ("__DATA", "__DATA_CONST", "__BSS", "__COMMON"):
+                typ = "OBJECT"
+            elif seg_name == "__TEXT" or sec_name in ("__text", "__stubs", "__symbol_stub"):
+                typ = "FUNC"
+            elif val in func_addrs:
+                typ = "FUNC"
+            elif export_info and lief.MachO.ExportInfo.FLAGS.REEXPORT in export_info.flags_list:
+                typ = "FUNC"
+
+            bind = "GLOBAL"
+            if export_info:
+                if lief.MachO.ExportInfo.FLAGS.WEAK_DEFINITION in export_info.flags_list:
+                    bind = "WEAK"
+            elif not sym.is_external:
+                bind = "LOCAL"
+
+            out.append(Symbol(name, bind, typ, "0", val, size, True, None, demangled=name))
+
         if not out:
-            for fn in getattr(bin_, "exported_functions", []):
-                name = getattr(fn, "name", "")
-                if not name:
-                    continue
-
-                out.append(Symbol(
-                    name=name,
-                    bind="GLOBAL",
-                    typ="FUNC",
-                    ndx="0",
-                    value=getattr(fn, "address", 0),
-                    size=0,
-                    default=True,
-                ))
-
-        if not out:
-            error(f"failed to analyze symbols in {path}")
+            error(f"failed to analyze symbols in {self.path}")
 
         return out
 
-    def default_load_name(self, path: str) -> str:
-        self._require_lief()
-        import lief
-
-        try:
-            bin_ = self._get_binary(path)
-
-            # macOS dynamic libraries specify their canonical "install name" using LC_ID_DYLIB
-            # This serves the same purpose as the DT_SONAME in ELF.
-            if bin_ and bin_.has_command(lief.MachO.LOAD_COMMAND_TYPES.ID_DYLIB):
-                cmd = bin_.get(lief.MachO.LOAD_COMMAND_TYPES.ID_DYLIB)
-                if cmd and getattr(cmd, "name", ""):
-                    return cmd.name.split("/")[-1]
-        except Exception:
-            pass
-
-        return os.path.basename(path)
+    def default_load_name(self) -> str:
+        if self.binary:
+            try:
+                for cmd in self.binary.commands:
+                    if cmd.command == lief.MachO.LoadCommand.TYPE.ID_DYLIB:
+                        full_name = cmd.name
+                        if full_name.startswith("@") or full_name.startswith("/"):
+                            return full_name
+                        return os.path.basename(full_name)
+            except Exception:
+                pass
+        return os.path.basename(self.path)
 
     def supports_vtables(self) -> bool:
-        return False
+        return True
 
-    def collect_sections(self, path: str) -> list[SectionInfo]:
+    def collect_sections(self) -> list[SectionInfo]:
         secs: list[SectionInfo] = []
-        try:
-            bin_ = self._get_binary(path)
-            for sec in getattr(bin_, "sections", []):
-                secs.append(SectionInfo(
-                    name=sec.name,
-                    address=sec.virtual_address,
-                    offset=sec.offset,
-                    size=sec.size,
-                    flags=str(sec.flags)
-                ))
-        except Exception:
-            pass
-
+        if self.binary:
+            try:
+                for sec in self.binary.sections:
+                    flags = "ALLOC" if sec.has_segment and sec.segment.name != "__PAGEZERO" else ""
+                    secs.append(SectionInfo(
+                        name=sec.name,
+                        address=sec.virtual_address,
+                        offset=sec.offset,
+                        size=sec.size,
+                        flags=flags
+                    ))
+            except Exception:
+                pass
         return secs
 
-    def collect_relocations(self, path: str) -> list[RelocationInfo]:
-        """Extracts resolved relocations utilizing LIEF's rebasing interpretation."""
+    def collect_relocations(self) -> list[RelocationInfo]:
         rels: list[RelocationInfo] = []
-        try:
-            bin_ = self._get_binary(path)
-            for rel in getattr(bin_, "relocations", []):
-                sym_name = rel.symbol.name if rel.has_symbol and rel.symbol else ""
-                rels.append(RelocationInfo(
-                    offset=rel.address,
-                    info=0,
-                    typ="SYMBOLIC" if sym_name else "RELATIVE",
-                    symbol_addend=(sym_name, 0)
-                ))
-        except Exception:
-            pass
+        if self.binary:
+            try:
+                for rel in self.binary.relocations:
+                    sym_name = rel.symbol.name if rel.has_symbol and rel.symbol else ""
+                    if sym_name.startswith("_"): sym_name = sym_name[1:]
+                    typ = "SYMBOLIC" if sym_name else "RELATIVE"
+                    rels.append(RelocationInfo(rel.address, 0, typ, (sym_name, 0)))
+                
+                for b in self.binary.bindings:
+                    sym_name = b.symbol.name if b.has_symbol and b.symbol else ""
+                    if sym_name.startswith("_"): sym_name = sym_name[1:]
+                    rels.append(RelocationInfo(b.address, 0, "SYMBOLIC", (sym_name, b.addend)))
 
+            except Exception:
+                pass
         return rels
 
-    def byteorder(self, path: str) -> str:
-        # Modern Apple environments (macOS x86_64 and arm64) are Little Endian.
+    def byteorder(self) -> str:
         return "little"

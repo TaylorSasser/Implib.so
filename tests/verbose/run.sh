@@ -19,7 +19,7 @@ fi
 
 . ../common.sh
 
-export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-}
 
 $CXX $CFLAGS -shared -frtti -fPIC interposed.cpp -o libinterposed.so
 ${PYTHON:-} ../../implib-gen.py -vvv -q --target $TARGET --vtables libinterposed.so >/dev/null 2>&1

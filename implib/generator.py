@@ -1,4 +1,4 @@
-# implibgen/generator.py
+# implib/generator.py
 from __future__ import annotations
 import os
 import re
@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable
 
-from implib.model import Symbol, SectionInfo, RelocationInfo
-from implib.base import BinaryBackend
+from implib.base import BinaryBackend, Symbol, SectionInfo, RelocationInfo
 from implib.log import warn, error
 
 
@@ -29,53 +28,16 @@ class GenOptions:
 
 InfoFn = Callable[[str], None]
 
-def _demangle_many(names: list[str]) -> list[str]:
-    """
-    Best-effort demangling without spawning c++filt.
-    Uses optional 'cxxfilt' module when available; otherwise returns input names.
-    """
-    try:
-        import cxxfilt  # type: ignore
-    except ImportError:
-        return list(names)
-    out: list[str] = []
-    for n in names:
-        try:
-            out.append(cxxfilt.demangle(n, external_only=False))
-        except Exception:
-            out.append(n)
-    return out
 
-
-def _read_unrelocated_data(input_path: str, syms: dict[str, Symbol], secs: list[SectionInfo]) -> dict[str, bytes]:
-    """
-    Read raw bytes for each symbol from file offsets computed via section mapping.
-    """
+def _read_unrelocated_data(backend: BinaryBackend, syms: dict[str, Symbol]) -> dict[str, bytes]:
     data: dict[str, bytes] = {}
-
-    def is_symbol_in_section(sym: Symbol, sec: SectionInfo) -> bool:
-        sec_end = sec.address + sec.size
-        is_start_in_section = sec.address <= sym.value < sec_end
-        is_end_in_section = sym.value + sym.size <= sec_end
-        return is_start_in_section and is_end_in_section
-
-    with open(input_path, "rb") as f:
-        for name, s in sorted(syms.items(), key=lambda it: it[1].value):
-            sec_matches = [sec for sec in secs if is_symbol_in_section(s, sec)]
-            if len(sec_matches) != 1:
-                error(
-                    f"failed to locate section for interval [{s.value:x}, {s.value + s.size:x})"
-                )
-            sec = sec_matches[0]
-            # Correct file offset: section file offset + (VA - section VA)
-            file_off = sec.offset + (s.value - sec.address)
-            f.seek(file_off)
-            data[name] = f.read(s.size)
-
+    for name, s in sorted(syms.items(), key=lambda it: it[1].value):
+        data[name] = backend.read_data(s.value, s.size)
     return data
 
 
 def _collect_relocated_data(
+        all_syms: list[Symbol],
         syms: dict[str, Symbol],
         bites: dict[str, bytes],
         rels: list[RelocationInfo],
@@ -85,16 +47,15 @@ def _collect_relocated_data(
         byteorder: str,
         demangled: dict[str, str],
 ) -> dict[str, list[tuple[str, object]]]:
-    """
-    Reconstruct per-symbol  fields  from raw bytes, and replace pointer slots
-    with ('reloc', rel_dict) when a relocation applies.
-    """
     data: dict[str, list[tuple[str, object]]] = {}
+    
+    addr_to_sym = {s.value: s.name for s in all_syms if s.value != 0}
+
     for name, s in sorted(syms.items()):
         b = bites.get(name)
         assert b is not None
         dname = demangled.get(name, "")
-        if dname.startswith("typeinfo name"):
+        if dname.startswith("typeinfo name") or "typeinfo name for" in dname:
             data[name] = [("byte", int(x)) for x in b]
             continue
 
@@ -110,30 +71,29 @@ def _collect_relocated_data(
             if rel.typ in reloc_types and start <= rel.offset < finish:
                 i = (rel.offset - start) // ptr_size
                 if i < len(entries):
-                    entries[i] = ("reloc", rel)
+                    sym_name, addend = rel.symbol_addend
+                    if not sym_name:
+                        raw_addr = entries[i][1]
+                        masked_addr = raw_addr & 0x0000FFFFFFFFFFFF
+                        sym_name = addr_to_sym.get(masked_addr, "")
+                        addend = 0
+                    
+                    if sym_name:
+                        resolved_rel = RelocationInfo(rel.offset, 0, rel.typ, (sym_name, addend))
+                        entries[i] = ("reloc", resolved_rel)
         data[name] = entries
     return data
 
 
 def _generate_vtables(cls_tables: dict, cls_syms: dict[str, Symbol], cls_data: dict) -> str:
-    """
-    Same codegen strategy as the legacy script: emit weak externs and const definitions.
-    """
     c_types = {
         "reloc": "const void *",
         "byte": "unsigned char",
         "offset": "size_t",
     }
     ss: list[str] = []
-    ss.append(
-        """\
-#ifdef __cplusplus
-extern "C" {
-#endif
-"""
-    )
+    ss.append("#ifdef __cplusplus\nextern \"C\" {\n#endif\n")
 
-    # externs for referenced symbols not defined in this translation unit
     printed: set[str] = set()
     for _, data in sorted(cls_data.items()):
         for typ, val in data:
@@ -143,13 +103,8 @@ extern "C" {
             sym_name = re.sub(r"@.*", "", sym_name)
             if sym_name and sym_name not in cls_syms and sym_name not in printed:
                 printed.add(sym_name)
-                ss.append(
-                    f"""\
-extern const char {sym_name}[];
-"""
-                )
+                ss.append(f"extern const char {sym_name}[];\n")
 
-    # build per-symbol struct layouts / initializers
     code_info: dict[str, tuple[str, str]] = {}
     for name, s in sorted(cls_syms.items()):
         data = cls_data[name]
@@ -171,34 +126,22 @@ extern const char {sym_name}[];
             else:
                 sym_name, addend = val.symbol_addend
                 sym_name = re.sub(r"@.*", "", sym_name)
-                vals.append(f"(const char *)&{sym_name} + {addend}")
+                if sym_name:
+                    vals.append(f"(const char *)&{sym_name} + {addend}")
+                else:
+                    vals.append(str(addend) + "UL")
         code_info[name] = (declarator, "{ %s }" % ", ".join(vals))
 
     for name, (decl, _) in sorted(code_info.items()):
         type_name = name + "_type"
         type_decl = decl % type_name
-        ss.append(
-            f"""\
-typedef {type_decl};
-extern __attribute__((weak)) {type_name} {name};
-"""
-        )
+        ss.append(f"typedef {type_decl};\nextern __attribute__((weak)) {type_name} {name};\n")
 
     for name, (_, init) in sorted(code_info.items()):
         type_name = name + "_type"
-        ss.append(
-            f"""\
-const {type_name} {name} = {init};
-"""
-        )
+        ss.append(f"const {type_name} {name} = {init};\n")
 
-    ss.append(
-        """\
-#ifdef __cplusplus
-}  // extern "C"
-#endif
-"""
-    )
+    ss.append("#ifdef __cplusplus\n}  // extern \"C\"\n#endif\n")
     return "".join(ss)
 
 
@@ -227,11 +170,9 @@ class Generator:
             opts: GenOptions,
     ) -> None:
         Path(outdir).mkdir(parents=True, exist_ok=True)
-        syms = self.backend.collect_symbols(input_path)
+        all_exported_symbols = self.backend.collect_symbols()
 
-        names = [s.name for s in syms]
-        demangled_list = _demangle_many(names)
-        demangled: dict[str, str] = {n: d for n, d in zip(names, demangled_list)}
+        demangled: dict[str, str] = {s.name: s.demangled for s in all_exported_symbols if s.demangled}
 
         def is_exported(s: Symbol) -> bool:
             conditions = [
@@ -239,21 +180,29 @@ class Generator:
                 s.typ != "NOTYPE",
                 s.ndx != "UND",
                 s.name not in ["", "_init", "_fini"],
-                ]
+                s.default,
+            ]
             if opts.no_weak_symbols:
                 conditions.append(s.bind != "WEAK")
             return all(conditions)
 
-        syms = [s for s in syms if is_exported(s)]
+        syms_list = [s for s in all_exported_symbols if is_exported(s)]
+
+        def is_vtable_name(name: str, dname: str) -> bool:
+            if "vtable for " in dname or "typeinfo " in dname or "typeinfo name for " in dname:
+                return True
+            n = name.lstrip('_')
+            return n.startswith(("ZTV", "ZTI", "ZTS"))
 
         def is_data_symbol(s: Symbol) -> bool:
             dname = demangled.get(s.name, "")
-            return (
-                    s.typ == "OBJECT"
-                    and not (" for " in dname and opts.vtables)
-            )
+            if s.typ not in ("OBJECT", "COMMON", "TLS") and s.ndx != "COM":
+                return False
+            if opts.vtables:
+                return not is_vtable_name(s.name, dname)
+            return True
 
-        exported_data = [s.name for s in syms if is_data_symbol(s)]
+        exported_data = [s.name for s in syms_list if is_data_symbol(s)]
         if exported_data:
             warn(
                 f"library '{input_path}' contains data symbols which won't be intercepted: "
@@ -262,7 +211,7 @@ class Generator:
 
         all_funs: set[str] = set()
         warned_versioned = False
-        for s in syms:
+        for s in syms_list:
             if s.typ != "FUNC":
                 continue
             if not s.default:
@@ -291,29 +240,35 @@ class Generator:
 
         vtable_text = ""
         if opts.vtables:
-            if self.backend.format_name != "elf":
-                if self.backend.format_name == "def":
-                    error("vtables not supported for .def files")
+            if not self.backend.supports_vtables():
                 error("vtables not supported for this file format")
 
             cls_tables: dict[str, dict[str, str]] = {}
             cls_syms: dict[str, Symbol] = {}
 
-            for s in syms:
+            for s in syms_list:
                 dname = demangled.get(s.name, "")
                 m = re.match(r"^(vtable|typeinfo|typeinfo name) for (.*)", dname)
                 if m is not None:
                     typ, cls = m.groups()
                     cls_tables.setdefault(cls, {})[typ] = s.name
                     cls_syms[s.name] = s
+                elif is_vtable_name(s.name, dname):
+                    name_no_und = s.name.lstrip('_')
+                    for prefix, typ in [("ZTV", "vtable"), ("ZTI", "typeinfo"), ("ZTS", "typeinfo name")]:
+                        if name_no_und.startswith(prefix):
+                            cls = name_no_und[len(prefix):]
+                            cls_tables.setdefault(cls, {})[typ] = s.name
+                            cls_syms[s.name] = s
+                            break
 
             if cls_syms:
-                secs = self.backend.collect_sections(input_path)
-                rels = self.backend.collect_relocations(input_path)
-                byteorder = self.backend.byteorder(input_path)
+                rels = self.backend.collect_relocations()
+                byteorder = self.backend.byteorder()
 
-                bites = _read_unrelocated_data(input_path, cls_syms, secs)
+                bites = _read_unrelocated_data(self.backend, cls_syms)
                 cls_data = _collect_relocated_data(
+                    all_exported_symbols,
                     cls_syms,
                     bites,
                     rels,

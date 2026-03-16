@@ -30,7 +30,7 @@ RUN='nice -n -20 taskset 1'
 $CC $CFLAGS -shared -fPIC interposed.c -o libinterposed.so
 ${PYTHON:-} ../../implib-gen.py -q --target $TARGET libinterposed.so
 
-export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-}
 
 # Baseline
 

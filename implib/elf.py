@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
-
 import re
+from typing import Any
 
 from implib.base import BinaryBackend, BackendError
 from implib.model import Symbol, SectionInfo, RelocationInfo
@@ -14,11 +14,6 @@ class ElfBackend(BinaryBackend):
     def default_platform(self) -> str:
         return "linux"
 
-    def __init__(self):
-        super().__init__()
-        self._current_path = None
-        self._current_bin = None
-
     def matches(self, path: str) -> bool:
         if path.lower().endswith(".def"):
             return True
@@ -27,7 +22,7 @@ class ElfBackend(BinaryBackend):
                 sig = f.read(4)
                 if sig == b"\x7fELF":
                     return True
-                # Check for EXPORTS in first few lines
+                # Check for EXPORTS in first few lines (for .def files)
                 f.seek(0)
                 for _ in range(10):
                     try:
@@ -40,27 +35,16 @@ class ElfBackend(BinaryBackend):
             pass
         return False
 
-    def _require_lief(self):
-        try:
-            import lief  # noqa: F401
-        except ImportError as e:
-            error(f"LIEF is required for ELF parsing but not installed. Error: {e!r}")
+    def _parse_lief_binary(self, path: str) -> Any:
+        import lief
+        bin_ = lief.parse(path)
+        if bin_ is None or not isinstance(bin_, lief.ELF.Binary):
+            return None
+        return bin_
 
-    def _get_binary(self, path: str):
-        if self._current_path != path:
-            self._require_lief()
-            import lief
-            try:
-                bin_ = lief.parse(path)
-                if bin_ is None or not isinstance(bin_, lief.ELF.Binary):
-                    bin_ = None
-            except Exception:
-                bin_ = None
-
-            self._current_bin = bin_
-            self._current_path = path
-
-        return self._current_bin
+    def _get_section_flags(self, section: Any) -> str:
+        # 2 is SHF_ALLOC
+        return "ALLOC" if getattr(section, "flags", 0) & 2 else ""
 
     def _collect_def_symbols(self, path: str) -> list[Symbol]:
         out: list[Symbol] = []
@@ -83,14 +67,6 @@ class ElfBackend(BinaryBackend):
             error(f"failed to parse .def file '{path}': {e}")
         return out
 
-    def read_data(self, path: str, address: int, size: int) -> bytes:
-        bin_ = self._get_binary(path)
-        if bin_ is None: return b""
-        try:
-            return bytes(bin_.get_content_from_virtual_address(address, size))
-        except Exception:
-            return b""
-
     def collect_symbols(self, path: str) -> list[Symbol]:
         bin_ = self._get_binary(path)
         if bin_ is None:
@@ -98,26 +74,8 @@ class ElfBackend(BinaryBackend):
 
         by_name: dict[str, Symbol] = {}
         order: list[str] = []
-
-        # Get all symbol addresses in sorted order for fast size calculation if missing
-        all_addrs = sorted({sym.value for sym in bin_.symbols if sym.value != 0})
-        sections = [(sec.virtual_address, sec.virtual_address + sec.size) for sec in bin_.sections]
-
-        import bisect
-        def get_exact_size(val: int, current_size: int) -> int:
-            if current_size > 0 or not val: return current_size
-            idx = bisect.bisect_right(all_addrs, val)
-            next_sym_addr = all_addrs[idx] if idx < len(all_addrs) else None
-            
-            sec_end = 0
-            for start, end in sections:
-                if start <= val < end:
-                    sec_end = end
-                    break
-            
-            if next_sym_addr and next_sym_addr < sec_end:
-                return next_sym_addr - val
-            return max(0, sec_end - val)
+        
+        sizes = self._calculate_symbol_sizes(bin_, bin_.symbols)
 
         def _score(sym: Symbol) -> tuple[int, int, int, int]:
             defined = 1 if sym.ndx != "UND" else 0
@@ -142,9 +100,7 @@ class ElfBackend(BinaryBackend):
             elif existing.version is None and new.version is not None:
                 existing.version, existing.default = new.version, new.default
 
-        static_syms = getattr(bin_, "static_symbols", [])
-        if not static_syms:
-            static_syms = getattr(bin_, "symbols", [])
+        static_syms = getattr(bin_, "static_symbols", []) or getattr(bin_, "symbols", [])
         dynamic_syms = getattr(bin_, "dynamic_symbols", [])
 
         for is_dyn, syms in [(False, static_syms), (True, dynamic_syms)]:
@@ -152,52 +108,34 @@ class ElfBackend(BinaryBackend):
                 name = sym.name
                 if not name: continue
 
-                try:
-                    bind = sym.binding.name.upper()
-                except AttributeError:
-                    bv = int(sym.binding) if hasattr(sym.binding, "__int__") else getattr(sym.binding, "value", 0)
-                    bind = {0: "LOCAL", 1: "GLOBAL", 2: "WEAK"}.get(bv, str(sym.binding).split(".")[-1]).upper()
+                bind = self._get_lief_attr(sym, "binding.name", "BINDING.name", "binding").upper()
+                typ = self._get_lief_attr(sym, "type.name", "TYPE.name", "type").upper()
+                vis = self._get_lief_attr(sym, "visibility.name", "VISIBILITY.name", "visibility").upper()
 
-                try:
-                    typ = sym.type.name.upper()
-                except AttributeError:
-                    tv = int(sym.type) if hasattr(sym.type, "__int__") else getattr(sym.type, "value", 0)
-                    typ = {0: "NOTYPE", 1: "OBJECT", 2: "FUNC", 3: "SECTION", 4: "FILE", 5: "COMMON", 6: "TLS"}.get(tv, str(sym.type).split(".")[-1]).upper()
+                # Handle raw values if name lookup failed
+                if not isinstance(bind, str): bind = {0: "LOCAL", 1: "GLOBAL", 2: "WEAK"}.get(int(bind), "LOCAL")
+                if not isinstance(typ, str): typ = {0: "NOTYPE", 1: "OBJECT", 2: "FUNC"}.get(int(typ), "NOTYPE")
+                if not isinstance(vis, str): vis = {0: "DEFAULT", 1: "INTERNAL", 2: "HIDDEN", 3: "PROTECTED"}.get(int(vis), "DEFAULT")
 
-                try:
-                    vis = sym.visibility.name.upper()
-                except AttributeError:
-                    vv = int(sym.visibility) if hasattr(sym.visibility, "__int__") else getattr(sym.visibility, "value", 0)
-                    vis = {0: "DEFAULT", 1: "INTERNAL", 2: "HIDDEN", 3: "PROTECTED"}.get(vv, str(sym.visibility).split(".")[-1]).upper()
-
-                # Use LIEF's section index
                 shndx = getattr(sym, "shndx", 0)
-                is_imported = getattr(sym, "is_imported", False)
-                if is_imported or shndx == 0:
+                if getattr(sym, "is_imported", False) or shndx == 0:
                     ndx = "UND"
-                elif shndx == 0xFFF1: # SHN_ABS
-                    ndx = "ABS"
-                elif shndx == 0xFFF2: # SHN_COMMON
-                    ndx = "COM"
-                else:
-                    ndx = str(shndx)
+                elif shndx == 0xFFF1: ndx = "ABS"
+                elif shndx == 0xFFF2: ndx = "COM"
+                else: ndx = str(shndx)
 
                 ver_name, default = None, True
                 if is_dyn and sym.has_version:
                     sym_ver = sym.symbol_version
                     if sym_ver:
-                        # MSB (0x8000) is the hidden bit in ELF versioning
                         default = not (sym_ver.value & 0x8000)
-                        try:
-                            ver_name = sym_ver.symbol_version_auxiliary.name
-                        except AttributeError:
-                            pass
+                        ver_name = getattr(sym_ver.symbol_version_auxiliary, "name", None)
 
                 if vis == "HIDDEN":
                     default = False
 
                 demangled = getattr(sym, "demangled_name", "") or name
-                size = get_exact_size(sym.value, sym.size)
+                size = sym.size if sym.size > 0 else sizes.get(sym.value, 0)
 
                 sym_obj = Symbol(name, bind, typ, ndx, sym.value, size, default, ver_name, demangled=demangled)
 
@@ -211,6 +149,16 @@ class ElfBackend(BinaryBackend):
         if not out: error(f"failed to analyze symbols in {path}")
         return out
 
+    def default_load_name(self, path: str) -> str:
+        bin_ = self._get_binary(path)
+        if bin_ is None:
+            return self._read_def_library_name(path) or os.path.basename(path)
+
+        for entry in bin_.dynamic_entries:
+            if getattr(entry, "tag", None) == 14: # DT_SONAME
+                return getattr(entry, "name", os.path.basename(path))
+        return os.path.basename(path)
+
     def _read_def_library_name(self, path: str) -> str | None:
         try:
             with open(path, "r") as f:
@@ -218,36 +166,16 @@ class ElfBackend(BinaryBackend):
                     line = line.strip()
                     m = re.match(r"^(?:LIBRARY|NAME)\s+([A-Za-z0-9_.\-]+)$", line, re.I)
                     if m: return m.group(1)
-        except Exception:
-            pass
+        except Exception: pass
         return os.path.splitext(os.path.basename(path))[0] + ".so"
-
-    def default_load_name(self, path: str) -> str:
-        bin_ = self._get_binary(path)
-        if bin_ is None:
-            return self._read_def_library_name(path) or os.path.basename(path)
-
-        for entry in bin_.dynamic_entries:
-            if getattr(entry, "tag", None) == 14: # 14 is DT_SONAME
-                return getattr(entry, "name", os.path.basename(path))
-        return os.path.basename(path)
 
     def supports_vtables(self) -> bool:
         return True
 
-    def collect_sections(self, path: str) -> list[SectionInfo]:
-        bin_ = self._get_binary(path)
-        secs: list[SectionInfo] = []
-        for sec in bin_.sections:
-            if getattr(sec, "flags", 0) & 2: # 2 is SHF_ALLOC
-                secs.append(SectionInfo(
-                    sec.name, sec.virtual_address, sec.offset, sec.size, "ALLOC"
-                ))
-        return secs
-
     def collect_relocations(self, path: str) -> list[RelocationInfo]:
         bin_ = self._get_binary(path)
         rels: list[RelocationInfo] = []
+        if bin_ is None: return []
 
         addr_syms = sorted(
             [(s.value, s.value + max(1, s.size), s.name)
@@ -261,11 +189,10 @@ class ElfBackend(BinaryBackend):
             for start, end, name in addr_syms:
                 if start <= addr < end: return name, addr - start
             best = next(( (name, addr - start) for start, _, name in reversed(addr_syms) if start <= addr ), None)
-            if best and best[1] <= 0x100000:
-                return best
+            if best and best[1] <= 0x100000: return best
             return None
 
-        byteorder = "little" if int(bin_.header.identity_data) == 1 else "big"
+        byteorder = self.byteorder(path)
         ptr_size = 8 if int(bin_.header.identity_class) == 2 else 4
         has_rela = any(getattr(e, "tag", 0) == 7 for e in bin_.dynamic_entries)
         m_type = int(bin_.header.machine_type)
@@ -286,30 +213,27 @@ class ElfBackend(BinaryBackend):
             rel_type_name = reloc_formatter(tv)
 
             sym_name = rel.symbol.name if rel.has_symbol and rel.symbol and rel.symbol.name else ""
-            if sym_name.startswith("."):
-                sym_name = ""
+            if sym_name.startswith("."): sym_name = ""
 
             addend = getattr(rel, 'addend', 0)
             if addend == 0 and not getattr(rel, 'is_rela', False) and not has_rela:
                 try:
-                    raw = bin_.get_content_from_virtual_address(rel.address, ptr_size)
+                    raw = self.read_data(path, rel.address, ptr_size)
                     if len(raw) == ptr_size:
                         val = int.from_bytes(bytes(raw), byteorder=byteorder, signed=False)
                         if val >= (1 << (ptr_size * 8 - 1)): val -= (1 << (ptr_size * 8))
                         addend = val
-                except Exception:
-                    pass
+                except Exception: pass
 
             target_address = addend + (getattr(rel.symbol, "value", 0) if rel.has_symbol and rel.symbol else 0)
             if not sym_name and target_address != 0:
                 got = resolve_addr(target_address)
-                if got is not None:
-                    sym_name, addend = got
+                if got is not None: sym_name, addend = got
 
             rels.append(RelocationInfo(rel.address, getattr(rel, 'info', 0), rel_type_name, (sym_name, addend)))
-
         return rels
 
     def byteorder(self, path: str) -> str:
         bin_ = self._get_binary(path)
+        if bin_ is None: return "little"
         return "little" if int(bin_.header.identity_data) == 1 else "big"

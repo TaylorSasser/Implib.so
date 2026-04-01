@@ -256,7 +256,9 @@ void *_${lib_suffix}_tramp_resolve(size_t i) {
   CHECK(addr, "failed to resolve symbol '%s' via callback $dlsym_callback", sym_names[i]);
 #else
   // Dlsym is thread-safe so don't need to protect it.
-  addr = dlsym(h, sym_names[i]);
+  const char *name = sym_names[i];
+  if (name[0] == '_') ++name;
+  addr = dlsym(h, name);
 #endif
 
   if (should_close_handle) {

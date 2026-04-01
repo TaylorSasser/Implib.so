@@ -31,11 +31,12 @@ class MachOBackend(BinaryBackend):
         
         target_cpu = None
         if self.arch:
+            # https://lief-project.github.io/doc/latest/api/python/macho/header.html#lief.MachO.Header.CPU_TYPE
             target_map = {
-                "aarch64": self._get_lief_attr(lief.MachO, "Header.CPU_TYPE.ARM64", "CPU_TYPES.ARM64"),
-                "x86_64": self._get_lief_attr(lief.MachO, "Header.CPU_TYPE.X86_64", "CPU_TYPES.X86_64"),
-                "i386": self._get_lief_attr(lief.MachO, "Header.CPU_TYPE.I386", "CPU_TYPES.I386"),
-                "arm": self._get_lief_attr(lief.MachO, "Header.CPU_TYPE.ARM", "CPU_TYPES.ARM"),
+                "aarch64": 16777228, # ARM64
+                "x86_64": 16777223,  # X86_64
+                "i386": 7,           # X86
+                "arm": 12,           # ARM
             }
             target_cpu = target_map.get(self.arch)
         
@@ -46,67 +47,84 @@ class MachOBackend(BinaryBackend):
 
     def _get_section_flags(self, section: Any) -> str:
         # Mach-O sections don't have ALLOC flag, but segments do.
-        # If segment is not __PAGEZERO, it's generally allocated.
         return "ALLOC" if section.has_segment and section.segment.name != "__PAGEZERO" else ""
 
     def collect_symbols(self, path: str) -> list[Symbol]:
         bin_ = self._get_binary(path)
         if bin_ is None: return []
 
-        import lief
-        EXP_REEXPORT = self._get_lief_attr(lief.MachO, "ExportInfo.KIND.REEXPORT", "EXPORT_SYMBOL_KINDS.REEXPORT", "KIND.REEXPORT", "ExportInfo.REEXPORT")
-        EXP_WEAK = self._get_lief_attr(lief.MachO, "ExportInfo.KIND.WEAK", "EXPORT_SYMBOL_KINDS.WEAK", "KIND.WEAK", "ExportInfo.WEAK")
-
-        sizes = self._calculate_symbol_sizes(bin_, bin_.symbols)
-        func_addrs = {f.address for f in getattr(bin_, "functions", [])}
+        all_symbols = list(bin_.symbols)
+        sizes = self._calculate_symbol_sizes(bin_, all_symbols)
+        func_addrs = {f.address for f in bin_.functions}
         
         sections_info = []
-        for sec in getattr(bin_, "sections", []):
-            sections_info.append((sec.virtual_address, sec.virtual_address + sec.size, sec.name, getattr(sec, "segment_name", "")))
+        for sec in bin_.sections:
+            sections_info.append((sec.virtual_address, sec.virtual_address + sec.size, sec.name, sec.segment_name))
 
         out: list[Symbol] = []
-        for sym in getattr(bin_, "exported_symbols", []):
+        # Pre-process exported symbols
+        exported_names = set()
+        for sym in bin_.exported_symbols:
             name = sym.name
             if not name: continue
-            if name.startswith("_"): name = name[1:]
-
+            
+            export_info = sym.export_info
             val = getattr(sym, "address", getattr(sym, "value", 0))
             size = sizes.get(val, 0)
-            
+
             seg_name, sec_name = "", ""
             for s_start, s_end, n, s in sections_info:
                 if s_start <= val < s_end:
                     sec_name, seg_name = n, s
                     break
-            
+
             typ = "OBJECT"
             if seg_name in ("__DATA", "__DATA_CONST", "__BSS", "__COMMON"): typ = "OBJECT"
             elif seg_name == "__TEXT" or sec_name in ("__text", "__stubs", "__symbol_stub") or val in func_addrs: typ = "FUNC"
+
+            flags = int(export_info.flags) if export_info else 0
+            ei_str = str(export_info.kind) if export_info else ""
             
-            export_info = getattr(sym, "export_info", None)
-            if export_info and EXP_REEXPORT is not None and export_info.kind == EXP_REEXPORT: typ = "FUNC"
+            if (flags & 8) or "REEXPORT" in ei_str: typ = "FUNC"
 
             bind = "GLOBAL"
-            if export_info and EXP_WEAK is not None and export_info.kind == EXP_WEAK: bind = "WEAK"
-            elif not getattr(sym, "is_external", True): bind = "LOCAL"
+            if (flags & 4) or "WEAK" in ei_str:
+                bind = "WEAK"
+            elif not export_info and not sym.is_external:
+                # Only mark as LOCAL if it's not in the export trie AND is not external
+                bind = "LOCAL"
 
-            out.append(Symbol(name, bind, typ, "0", val, size, True, None, demangled=name))
+            demangled = sym.demangled_name or name
+            out.append(Symbol(name, bind, typ, "0", val, size, True, True, demangled=demangled))
+            exported_names.add(name)
+
+        # Include non-exported symbols for relocation resolution
+        for sym in all_symbols:
+            name = sym.name
+            if not name or name in exported_names: continue
+            
+            val = sym.value
+            size = sizes.get(val, 0)
+            
+            out.append(Symbol(name, "LOCAL", "OBJECT", "0", val, size, True, False, demangled=sym.demangled_name or name))
 
         if not out: error(f"failed to analyze symbols in {path}")
         return out
 
     def default_load_name(self, path: str) -> str:
-        import lief
         bin_ = self._get_binary(path)
         if not bin_: return os.path.basename(path)
 
-        ID_DYLIB = self._get_lief_attr(lief.MachO, "LoadCommand.TYPE.ID_DYLIB", "LOAD_COMMAND_TYPES.ID_DYLIB")
-        if ID_DYLIB and bin_.has_command(ID_DYLIB):
-            cmd = bin_.get(ID_DYLIB)
-            if cmd and getattr(cmd, "name", ""):
-                full_name = cmd.name
-                if full_name.startswith(("@", "/")): return full_name
-                return os.path.basename(full_name)
+        cmd = None
+        for c in bin_.commands:
+            if int(c.command) == 13: # ID_DYLIB
+                cmd = c
+                break
+
+        if cmd and cmd.name:
+            full_name = cmd.name
+            if full_name.startswith(("@", "/")): return full_name
+            return os.path.basename(full_name)
         return os.path.basename(path)
 
     def supports_vtables(self) -> bool:
@@ -117,19 +135,18 @@ class MachOBackend(BinaryBackend):
         if not bin_: return []
         rels: list[RelocationInfo] = []
 
-        for rel in getattr(bin_, "relocations", []):
-            sym_name = rel.symbol.name if rel.has_symbol and rel.symbol else ""
-            if sym_name.startswith("_"): sym_name = sym_name[1:]
+        for rel in bin_.relocations:
+            sym_name = rel.symbol.name if rel.has_symbol else ""
             typ = "SYMBOLIC" if sym_name else "RELATIVE"
-            rels.append(RelocationInfo(rel.address, 0, typ, (sym_name, getattr(rel, "addend", 0))))
+            addend = getattr(rel, "addend", 0)
+            rels.append(RelocationInfo(rel.address, 0, typ, (sym_name, addend)))
         
-        for source in [getattr(bin_, "bindings", []), getattr(bin_, "lazy_bindings", []), getattr(bin_, "weak_bindings", [])]:
+        for source in [bin_.bindings, bin_.lazy_bindings, bin_.weak_bindings]:
             for b in source:
-                sym_name = b.symbol.name if b.has_symbol and b.symbol else ""
-                if sym_name.startswith("_"): sym_name = sym_name[1:]
+                sym_name = b.symbol.name if b.has_symbol else ""
                 rels.append(RelocationInfo(b.address, 0, "SYMBOLIC", (sym_name, b.addend)))
 
-        for r in getattr(bin_, "rebases", []):
+        for r in bin_.rebases:
             rels.append(RelocationInfo(r.address, 0, "RELATIVE", ("", 0)))
         return rels
 

@@ -7,12 +7,12 @@
  * found in the LICENSE.txt file.
  */
 
-  .globl _$sym
+  .globl $sym
   .p2align 4
 #ifndef IMPLIB_EXPORT_SHIMS
-  .private_extern _$sym
+  .private_extern $sym
 #endif
-_$sym:
+$sym:
   .cfi_startproc
 
 1:

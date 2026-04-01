@@ -11,7 +11,7 @@ class Symbol:
     value: int = 0
     size: int = 0
     default: bool = True
-    version: Optional[str] = None
+    exported: bool = True
     demangled: Optional[str] = None
 
 @dataclass()

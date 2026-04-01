@@ -25,20 +25,6 @@ class BinaryBackend(ABC):
         except ImportError as e:
             error(f"LIEF is required for {self.format_name} parsing but not installed. Error: {e!r}")
 
-    def _get_lief_attr(self, mod: Any, *names: str) -> Any:
-        """Helper to handle LIEF attribute renames across versions."""
-        for name in names:
-            try:
-                parts = name.split('.')
-                obj = mod
-                for p in parts:
-                    obj = getattr(obj, p)
-                if obj is not None:
-                    return obj
-            except AttributeError:
-                continue
-        return None
-
     @abstractmethod
     def _parse_lief_binary(self, path: str) -> Any:
         ...
@@ -51,7 +37,6 @@ class BinaryBackend(ABC):
                 self._current_bin = self._parse_lief_binary(path)
             except Exception as e:
                 self._current_bin = None
-                # Don't die here, might be a .def file or other format
             self._current_path = path
         return self._current_bin
 
@@ -69,7 +54,7 @@ class BinaryBackend(ABC):
         if bin_ is None:
             return []
         secs: list[SectionInfo] = []
-        for sec in getattr(bin_, "sections", []):
+        for sec in bin_.sections:
             flags = self._get_section_flags(sec)
             secs.append(SectionInfo(
                 sec.name, sec.virtual_address, sec.offset, sec.size, flags
@@ -80,7 +65,6 @@ class BinaryBackend(ABC):
         return ""
 
     def _calculate_symbol_sizes(self, bin_: Any, symbols: list[Any]) -> dict[int, int]:
-        """Shared logic to calculate symbol sizes when missing (using address of next symbol or section end)."""
         all_addrs = sorted({sym.value for sym in bin_.symbols if sym.value != 0})
         sections = [(sec.virtual_address, sec.virtual_address + sec.size) for sec in bin_.sections]
         

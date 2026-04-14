@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import argparse
 import bisect
 import configparser
+import itertools
 import os
 import re
 import string
@@ -16,36 +18,29 @@ import lief
 
 ME: str = "implib-gen"
 
-
 def set_me_from_argv0(argv0: str) -> None:
     global ME
     ME = os.path.basename(argv0)
 
-
 def warn(msg: str) -> None:
     sys.stderr.write(f"{ME}: warning: {msg}\n")
-
 
 def error(msg: str) -> None:
     sys.stderr.write(f"{ME}: error: {msg}\n")
     sys.exit(1)
 
-
 def die(msg: str) -> None:
     sys.stderr.write(f"implib-gen.py: error: {msg}\n")
     sys.exit(1)
 
-
 def info_printer(quiet: bool) -> Callable[[str], None]:
     return lambda msg: None if quiet else print(msg)
-
 
 MAGIC_ELF: bytes = b"\x7fELF"
 MAGIC_MACHO: set[bytes] = {
     b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
     b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
 }
-
 
 @dataclass
 class Symbol:
@@ -59,6 +54,9 @@ class Symbol:
     version: Optional[str] = None
     demangled: Optional[str] = None
 
+    @property
+    def score(self) -> tuple[bool, bool, bool, bool, bool]:
+        return self.ndx != "UND", self.bind != "LOCAL", self.typ != "NOTYPE", self.size > 0, self.value != 0
 
 @dataclass
 class SectionInfo:
@@ -68,7 +66,6 @@ class SectionInfo:
     size: int
     flags: str
 
-
 @dataclass
 class RelocationInfo:
     offset: int
@@ -76,9 +73,7 @@ class RelocationInfo:
     typ: str
     symbol_addend: tuple[str, int]
 
-
 class BackendError(RuntimeError): pass
-
 
 class BinaryBackend(ABC):
     format_name: str
@@ -122,10 +117,10 @@ class BinaryBackend(ABC):
                     if line.upper() == "EXPORTS":
                         exports_found = True
                     elif exports_found:
-                        m = re.match(r'^\s+([A-Za-z0-9_]+)\s*$', line)
-                        if m is None:
+                        if m := re.match(r'^\s+([A-Za-z0-9_]+)\s*$', line):
+                            out.append(Symbol(m.group(1), "GLOBAL", "FUNC", "1", demangled=m.group(1)))
+                        else:
                             break
-                        out.append(Symbol(m[1], "GLOBAL", "FUNC", "1", demangled=m[1]))
         except Exception as e:
             error(f"failed to parse .def file '{self.path}': {e}")
         return out
@@ -147,11 +142,13 @@ class BinaryBackend(ABC):
             if self.is_def: return None
             try:
                 if (parsed := lief.parse(self.path)) is None: raise BackendError(f"LIEF failed to parse '{self.path}'")
+
                 if isinstance(parsed, lief.MachO.FatBinary):
-                    cpu = {"aarch64": lief.MachO.Header.CPU_TYPE.ARM64, "x86_64": lief.MachO.Header.CPU_TYPE.X86_64,
-                           "i386": lief.MachO.Header.CPU_TYPE.X86, "arm": lief.MachO.Header.CPU_TYPE.ARM}.get(
-                        self.arch) if self.arch else None
-                    self._bin = parsed.take(cpu) if cpu and parsed.has(cpu) else parsed.at(0)
+                    # We don't support X86 mac
+                    cpu = lief.MachO.Header.CPU_TYPE.ARM64
+                    self._bin = parsed.take(cpu)
+                    if self._bin is None:
+                        raise BackendError(f"Mach-O FatBinary '{self.path}' does not contain an ARM64 slice.")
                 else:
                     self._bin = parsed
             except Exception as e:
@@ -159,12 +156,10 @@ class BinaryBackend(ABC):
         return self._bin
 
     @abstractmethod
-    def matches(self) -> bool:
-        ...
+    def matches(self) -> bool: ...
 
     @abstractmethod
-    def collect_symbols(self) -> list[Symbol]:
-        ...
+    def collect_symbols(self) -> list[Symbol]: ...
 
     def read_data(self, address: int, size: int) -> bytes:
         try:
@@ -175,17 +170,10 @@ class BinaryBackend(ABC):
     def default_load_name(self) -> str:
         return self._read_def_library_name() or ""
 
-    def collect_sections(self) -> list[SectionInfo]:
-        return []
-
-    def collect_relocations(self) -> list[RelocationInfo]:
-        return []
-
-    def supports_vtables(self) -> bool:
-        return False
-
-    def byteorder(self) -> str:
-        return "little"
+    def collect_sections(self) -> list[SectionInfo]: return []
+    def collect_relocations(self) -> list[RelocationInfo]: return []
+    def supports_vtables(self) -> bool: return False
+    def byteorder(self) -> str: return "little"
 
     def _get_exact_size(self, val: int, original_size: int = 0) -> int:
         if original_size > 0: return original_size
@@ -196,13 +184,15 @@ class BinaryBackend(ABC):
             self._func_sizes = {f.address: f.size for f in self.binary.functions if f.size > 0}
 
         if val in self._func_sizes: return self._func_sizes[val]
+
         limit = self._next_addr_map.get(val)
         try:
-            sec = self.binary.section_from_virtual_address(val)
-            sec_end = (sec.virtual_address + sec.size) if sec else 0
+            if sec := self.binary.section_from_virtual_address(val):
+                sec_end = sec.virtual_address + sec.size
+                limit = min(limit, sec_end) if limit else sec_end
         except Exception:
-            sec_end = 0
-        limit = limit if limit and (not sec_end or limit < sec_end) else sec_end
+            pass
+
         return max(0, limit - val) if limit else 0
 
 
@@ -224,25 +214,26 @@ class ElfBackend(BinaryBackend):
         if not self.binary: return self._collect_def_symbols()
         by_name: dict[str, Symbol] = {}
 
-        for sym in self.binary.exported_symbols:
+        for sym in itertools.chain(self.binary.dynamic_symbols, self.binary.symbols):
             if not sym.name: continue
-            ndx = "UND" if sym.imported or sym.shndx == 0 else "ABS" if sym.shndx == 0xFFF1 else "COM" if sym.shndx == 0xFFF2 else str(
-                sym.shndx)
+
+            ndx = "UND" if sym.imported or sym.shndx == 0 else "ABS" if sym.shndx == 0xFFF1 else "COM" if sym.shndx == 0xFFF2 else str(sym.shndx)
 
             ver_name, default = None, True
             if sym.has_version and sym.symbol_version:
                 default = not (sym.symbol_version.value & 0x8000)
-                if sym.symbol_version.symbol_version_auxiliary: ver_name = sym.symbol_version.symbol_version_auxiliary.name
-            if sym.visibility == lief.ELF.Symbol.VISIBILITY.HIDDEN: default = False
+                if sym.symbol_version.symbol_version_auxiliary:
+                    ver_name = sym.symbol_version.symbol_version_auxiliary.name
+
+            if sym.visibility == lief.ELF.Symbol.VISIBILITY.HIDDEN:
+                default = False
 
             s_obj = Symbol(name=sym.name, bind=sym.binding.name, typ=sym.type.name, ndx=ndx, value=sym.value,
                            size=self._get_exact_size(sym.value, sym.size), default=default,
                            version=ver_name, demangled=sym.demangled_name or sym.name)
-            score = lambda s: (s.ndx != "UND", s.typ != "NOTYPE", s.size > 0, s.value != 0)
 
             existing = by_name.get(sym.name)
-            if not existing or score(s_obj) > score(existing) or (
-                    existing.version is None and s_obj.version is not None):
+            if not existing or s_obj.score > existing.score or (existing.version is None and s_obj.version is not None):
                 if existing and s_obj.version is None: s_obj.version, s_obj.default = existing.version, existing.default
                 by_name[sym.name] = s_obj
             elif s_obj.version is not None and existing.version is not None and s_obj.default and not existing.default:
@@ -260,8 +251,7 @@ class ElfBackend(BinaryBackend):
                 pass
         return os.path.basename(self.path)
 
-    def supports_vtables(self) -> bool:
-        return True
+    def supports_vtables(self) -> bool: return True
 
     def collect_sections(self) -> list[SectionInfo]:
         return [SectionInfo(s.name, s.virtual_address, s.offset, s.size, "ALLOC") for s in self.binary.sections if
@@ -269,26 +259,29 @@ class ElfBackend(BinaryBackend):
 
     def collect_relocations(self) -> list[RelocationInfo]:
         if not self.binary: return []
+
         addr_syms = sorted([(s.value, s.value + max(1, s.size), s.name) for s in self.binary.symbols if
                             s.name and s.value != 0 and not s.name.startswith(".")], key=lambda t: t[0])
         starts = [t[0] for t in addr_syms]
+        is_i386 = self.binary.header.machine_type == lief.ELF.ARCH.I386
 
         rels: list[RelocationInfo] = []
         for rel in self.binary.relocations:
-            rel_type = f"R_{rel.type.name}".replace("R_X86_",
-                                                    "R_386_") if self.binary.header.machine_type == lief.ELF.ARCH.I386 else f"R_{rel.type.name}"
-            try:
-                target_addr = rel.resolve()
-            except Exception:
-                target_addr = rel.addend + (rel.symbol.value if rel.has_symbol else 0)
+            rel_type = f"R_{rel.type.name}".replace("R_X86_", "R_386_") if is_i386 else f"R_{rel.type.name}"
+
+            try: target_addr = rel.resolve()
+            except Exception: target_addr = rel.addend + (rel.symbol.value if rel.has_symbol else 0)
 
             sym_name, addend = "", target_addr
             if rel.has_symbol and rel.symbol.name and not rel.symbol.name.startswith("."):
                 sym_name, addend = rel.symbol.name, target_addr - rel.symbol.value
-            else:
+            elif starts:
                 idx = bisect.bisect_right(starts, target_addr) - 1
-                if idx >= 0 and (target_addr < addr_syms[idx][1] or target_addr - addr_syms[idx][
-                    0] <= 0x100000): sym_name, addend = addr_syms[idx][2], target_addr - addr_syms[idx][0]
+                if idx >= 0:
+                    start, end, name = addr_syms[idx]
+                    if target_addr < end or target_addr - start <= 0x100000:
+                        sym_name, addend = name, target_addr - start
+
             rels.append(RelocationInfo(rel.address, rel.info, rel_type, (sym_name, addend)))
         return rels
 
@@ -298,7 +291,6 @@ class ElfBackend(BinaryBackend):
 
 class MachOBackend(BinaryBackend):
     format_name: str = "macho"
-
 
     @property
     def binary(self) -> Optional[lief.MachO.Binary]:
@@ -310,9 +302,8 @@ class MachOBackend(BinaryBackend):
     def default_load_name(self) -> str:
         if self.binary:
             try:
-                for cmd in self.binary.commands:
-                    if cmd.command == lief.MachO.LoadCommand.TYPE.ID_DYLIB:
-                        return os.path.basename(cmd.name)
+                if cmd := self.binary.get(lief.MachO.LoadCommand.TYPE.ID_DYLIB):
+                    return os.path.basename(cmd.name)
             except Exception:
                 pass
         return os.path.basename(self.path)
@@ -323,62 +314,55 @@ class MachOBackend(BinaryBackend):
         func_addrs = {f.address for f in self.binary.functions if f.size > 0}
         by_name: dict[str, Symbol] = {}
 
-        def get_score(s: Symbol) -> tuple[bool, bool, bool, bool, bool]:
-            return s.ndx != "UND", s.bind != "LOCAL", s.typ != "NOTYPE", s.size > 0, s.value != 0
-
         for sym in self.binary.symbols:
-            if not sym.name:
-                continue
-            if sym.category == lief.MachO.Symbol.CATEGORY.NONE:
+            if not sym.name or sym.category == lief.MachO.Symbol.CATEGORY.NONE:
                 continue
 
             name = sym.name[1:] if sym.name.startswith("_") else sym.name
             val, size = sym.value, sym.size
 
-            try:
-                sec = self.binary.section_from_virtual_address(val)
-            except Exception:
-                sec = None
+            try: sec = self.binary.section_from_virtual_address(val)
+            except Exception: sec = None
 
-            sec_name = sec.name if sec else ""
-            seg_name = sec.segment.name if sec and sec.has_segment and sec.segment else ""
             typ, bind, ndx, default = "OBJECT", "LOCAL", "0", True
 
-            if seg_name in ("__DATA", "__DATA_CONST", "__BSS", "__COMMON"):
-                typ = "OBJECT"
-            elif seg_name == "__TEXT" or sec_name in ("__text", "__stubs", "__symbol_stub") or val in func_addrs:
+            is_func = val in func_addrs
+            if sec and not is_func:
+                flags = lief.MachO.Section.FLAGS
+
+                is_code = sec.has(flags.SOME_INSTRUCTIONS) or sec.has(flags.PURE_INSTRUCTIONS)
+                is_stub = sec.type == lief.MachO.Section.TYPE.SYMBOL_STUBS
+                is_exec = sec.has_segment and sec.segment and (sec.segment.init_protection & lief.MachO.SegmentCommand.VM_PROTECTIONS.X.value)
+
+                if is_code or is_stub or is_exec:
+                    is_func = True
+
+            if is_func:
                 typ = "FUNC"
 
             if sym.category == lief.MachO.Symbol.CATEGORY.UNDEFINED:
                 ndx = "UND"
-                bind = "WEAK" if sym.binding_info and sym.binding_info.weak_import else "GLOBAL"
+                bind = "WEAK" if sym.has_binding_info and sym.binding_info.weak_import else "GLOBAL"
 
             elif sym.category == lief.MachO.Symbol.CATEGORY.EXTERNAL:
                 bind = "GLOBAL"
                 if sym.has_export_info and sym.export_info:
-                    flags = {f.name for f in sym.export_info.flags_list}
-                    if "WEAK_DEFINITION" in flags: bind = "WEAK"
-                    if "REEXPORT" in flags: typ = "FUNC"
+                    flags = sym.export_info.flags_list
+                    if lief.MachO.ExportInfo.FLAGS.WEAK_DEFINITION in flags: bind = "WEAK"
+                    if lief.MachO.ExportInfo.FLAGS.REEXPORT in flags: typ = "FUNC"
                 else:
                     default = False
 
-            s_obj = Symbol(
-                name, bind, typ, ndx, val,
-                self._get_exact_size(val, size),
-                default, None,
-                demangled=sym.demangled_name or name
-            )
+            s_obj = Symbol(name, bind, typ, ndx, val, self._get_exact_size(val, size), default, None, demangled=sym.demangled_name or name)
 
-            if name not in by_name or get_score(s_obj) > get_score(by_name[name]):
+            existing = by_name.get(name)
+            if not existing or s_obj.score > existing.score:
                 by_name[name] = s_obj
 
-        if not by_name:
-            error(f"failed to analyze symbols in {self.path}")
-
+        if not by_name: error(f"failed to analyze symbols in {self.path}")
         return list(by_name.values())
 
-    def supports_vtables(self) -> bool:
-        return True
+    def supports_vtables(self) -> bool: return True
 
     def collect_sections(self) -> list[SectionInfo]:
         return [SectionInfo(s.name, s.virtual_address, s.offset, s.size,
@@ -387,15 +371,18 @@ class MachOBackend(BinaryBackend):
 
     def collect_relocations(self) -> list[RelocationInfo]:
         rels: list[RelocationInfo] = []
-        if self.binary:
-            for rel in self.binary.relocations:
-                sym_name = rel.symbol.name if rel.has_symbol and rel.symbol else ""
-                if sym_name.startswith("_"): sym_name = sym_name[1:]
-                rels.append(RelocationInfo(rel.address, 0, "SYMBOLIC" if sym_name else "RELATIVE", (sym_name, 0)))
-            for b in self.binary.bindings:
-                sym_name = b.symbol.name if b.has_symbol and b.symbol else ""
-                if sym_name.startswith("_"): sym_name = sym_name[1:]
-                rels.append(RelocationInfo(b.address, 0, "SYMBOLIC", (sym_name, b.addend)))
+        if not self.binary: return rels
+
+        for rel in self.binary.relocations:
+            sym_name = rel.symbol.name if rel.has_symbol and rel.symbol else ""
+            if sym_name.startswith("_"): sym_name = sym_name[1:]
+            rels.append(RelocationInfo(rel.address, 0, "SYMBOLIC" if sym_name else "RELATIVE", (sym_name, 0)))
+
+        for b in self.binary.bindings:
+            sym_name = b.symbol.name if b.has_symbol and b.symbol else ""
+            if sym_name.startswith("_"): sym_name = sym_name[1:]
+            rels.append(RelocationInfo(b.address, 0, "SYMBOLIC", (sym_name, b.addend)))
+
         return rels
 
 
@@ -437,8 +424,10 @@ def _collect_relocated_data(all_syms: list[Symbol], syms: dict[str, Symbol], bit
             if rel.typ in reloc_types and s.value <= rel.offset < s.value + s.size:
                 if (i := (rel.offset - s.value) // ptr_size) < len(entries):
                     sym_name, addend = rel.symbol_addend
-                    if not sym_name: sym_name, addend = addr_to_sym.get(entries[i][1] & 0x0000FFFFFFFFFFFF, ""), 0
-                    if sym_name: entries[i] = ("reloc", RelocationInfo(rel.offset, 0, rel.typ, (sym_name, addend)))
+                    if not sym_name and entries[i][0] == "offset":
+                        sym_name, addend = addr_to_sym.get(entries[i][1] & 0x0000FFFFFFFFFFFF, ""), 0
+                    if sym_name:
+                        entries[i] = ("reloc", RelocationInfo(rel.offset, 0, rel.typ, (sym_name, addend)))
         data[name] = entries
     return data
 
@@ -451,29 +440,31 @@ def _generate_vtables(cls_syms: dict[str, Symbol], cls_data: dict) -> str:
 
     for _, data in sorted(cls_data.items()):
         for typ, val in data:
-            if typ == "reloc" and (sym_name := re.sub(r"@.*", "", val.symbol_addend[
-                0])) and sym_name not in cls_syms and sym_name not in printed:
+            if typ == "reloc" and (sym_name := re.sub(r"@.*", "", val.symbol_addend[0])) and sym_name not in cls_syms and sym_name not in printed:
                 printed.add(sym_name)
                 ss.append(f"extern const char {sym_name}[];\n")
 
     for name, s in sorted(cls_syms.items()):
         data = cls_data[name]
-        declarator = "const unsigned char %s[]" if data and data[0][
-            0] == "byte" else "const struct { %s } %%s" % " ".join(
+        declarator = "const unsigned char %s[]" if data and data[0][0] == "byte" else "const struct { %s } %%s" % " ".join(
             f"{c_types[typ]} field_{i};" for i, (typ, _) in enumerate(data))
+
         vals = []
         for typ, val in data:
             if typ != "reloc":
                 vals.append(f"{val}UL")
             else:
                 sym_name = re.sub(r"@.*", "", val.symbol_addend[0])
-                vals.append(
-                    f"(const char *)&{sym_name} + {val.symbol_addend[1]}" if sym_name else f"{val.symbol_addend[1]}UL")
+                vals.append(f"(const char *)&{sym_name} + {val.symbol_addend[1]}" if sym_name else f"{val.symbol_addend[1]}UL")
+
         code_info[name] = (declarator, "{ %s }" % ", ".join(vals))
 
-    for name, (decl, _) in sorted(code_info.items()): ss.append(
-        f"typedef {decl % (name + '_type')};\nextern __attribute__((weak)) {name}_type {name};\n")
-    for name, (_, init) in sorted(code_info.items()): ss.append(f"const {name}_type {name} = {init};\n")
+    for name, (decl, init) in sorted(code_info.items()):
+        t_name = f"{name}_type"
+        ss.append(f"typedef {decl % t_name};\n")
+        ss.append(f"extern __attribute__((weak)) {t_name} {name};\n")
+        ss.append(f"const {t_name} {name} = {init};\n")
+
     ss.append("#ifdef __cplusplus\n}  // extern \"C\"\n#endif\n")
     return "".join(ss)
 
@@ -496,32 +487,36 @@ class Generator:
         Path(outdir).mkdir(parents=True, exist_ok=True)
         all_exported_symbols = self.backend.collect_symbols()
         demangled = {s.name: s.demangled for s in all_exported_symbols if s.demangled}
-        syms_list = [s for s in all_exported_symbols if
-                     s.bind != "LOCAL" and s.typ != "NOTYPE" and s.ndx != "UND" and s.name not in ("", "_init",
-                                                                                                   "_fini") and s.default and (
-                             not opts.no_weak_symbols or s.bind != "WEAK")]
+
+        syms_list: list[Symbol] = []
+        warned_versioned: bool = False
+
+        for s in all_exported_symbols:
+            if s.bind == "LOCAL" or s.typ == "NOTYPE" or s.ndx == "UND" or s.name in ("", "_init", "_fini"):
+                continue
+            if opts.no_weak_symbols and s.bind == "WEAK":
+                continue
+
+            if not s.default:
+                if s.typ == "FUNC":
+                    if not warned_versioned:
+                        warn(f"library {input_path} contains hidden/versioned symbols which are NYI")
+                        warned_versioned = True
+                    if opts.verbose: self.info(f"Skipping hidden/versioned symbol {s.name}")
+                continue
+
+            syms_list.append(s)
 
         def is_vtable_name(name: str, dname: str) -> bool:
-            return "vtable for " in dname or "typeinfo " in dname or "typeinfo name for " in dname or name.lstrip(
-                '_').startswith(("ZTV", "ZTI", "ZTS"))
+            return "vtable for " in dname or "typeinfo " in dname or "typeinfo name for " in dname or name.lstrip('_').startswith(("ZTV", "ZTI", "ZTS"))
 
         if exported_data := [s.name for s in syms_list if (s.typ in ("OBJECT", "COMMON", "TLS") or s.ndx == "COM") and (
                 not opts.vtables or not is_vtable_name(s.name, demangled.get(s.name, "")))]:
             warn(f"library '{input_path}' contains data symbols which won't be intercepted: {', '.join(exported_data)}")
 
-        all_funs: set[str] = set()
-        warned_versioned: bool = False
-        for s in syms_list:
-            if s.typ == "FUNC":
-                if not s.default:
-                    if not warned_versioned:
-                        warn(f"library {input_path} contains versioned symbols which are NYI")
-                        warned_versioned = True
-                    if opts.verbose: self.info(f"Skipping versioned symbol {s.name}")
-                else:
-                    all_funs.add(s.name)
-
+        all_funs = {s.name for s in syms_list if s.typ == "FUNC"}
         funs = sorted(all_funs) if funs_allowlist is None else [n for n in funs_allowlist if n in all_funs]
+
         if funs_allowlist is None:
             if not funs and not opts.quiet: warn(f"no public functions were found in {input_path}")
         elif missing := [n for n in funs_allowlist if n not in all_funs]:
@@ -529,44 +524,45 @@ class Generator:
 
         if opts.verbose:
             self.info("Exported functions:")
-            [self.info(f"  {i}: {fn}") for i, fn in enumerate(funs)]
+            for i, fn in enumerate(funs):
+                self.info(f"  {i}: {fn}")
 
         vtable_text = ""
         if opts.vtables:
             if not self.backend.supports_vtables(): error("vtables not supported for this file format")
             cls_tables: dict[str, dict[str, str]] = {}
             cls_syms: dict[str, Symbol] = {}
+
             for s in syms_list:
                 dname = demangled.get(s.name, "")
                 if m := re.match(r"^(vtable|typeinfo|typeinfo name) for (.*)", dname):
-                    cls_tables.setdefault(m.group(2), {})[m.group(1)], cls_syms[s.name] = s.name, s
+                    typ, cls_name = m.groups()
+                    cls_tables.setdefault(cls_name, {})[typ] = s.name
+                    cls_syms[s.name] = s
                 elif is_vtable_name(s.name, dname):
                     name_no_und = s.name.lstrip('_')
                     for prefix, typ in [("ZTV", "vtable"), ("ZTI", "typeinfo"), ("ZTS", "typeinfo name")]:
-                        if name_no_und.startswith(prefix): cls_tables.setdefault(name_no_und[len(prefix):], {})[typ], \
-                            cls_syms[s.name] = s.name, s; break
+                        if name_no_und.startswith(prefix):
+                            cls_name = name_no_und[len(prefix):]
+                            cls_tables.setdefault(cls_name, {})[typ] = s.name
+                            cls_syms[s.name] = s
+                            break
 
             if cls_syms:
-                vtable_text = _generate_vtables(cls_syms, _collect_relocated_data(all_exported_symbols, cls_syms,
-                                                                                  _read_unrelocated_data(self.backend,
-                                                                                                         cls_syms),
-                                                                                  self.backend.collect_relocations(),
-                                                                                  opts.ptr_size,
-                                                                                  opts.symbol_reloc_types,
-                                                                                  byteorder=self.backend.byteorder(),
-                                                                                  demangled=demangled))
+                vtable_text = _generate_vtables(cls_syms, _collect_relocated_data(
+                    all_exported_symbols, cls_syms, _read_unrelocated_data(self.backend, cls_syms),
+                    self.backend.collect_relocations(), opts.ptr_size, opts.symbol_reloc_types,
+                    byteorder=self.backend.byteorder(), demangled=demangled
+                ))
 
         lib_suffix, tramp_file, init_file = re.sub(r"[^a-zA-Z_0-9]+", "_", stem), f"{stem}.tramp.S", f"{stem}.init.c"
         if not opts.quiet: self.info(f"Generating {tramp_file}...")
 
         with open(os.path.join(outdir, tramp_file), "w") as f:
-            f.write(string.Template((self.templates_dir / "table.S.tpl").read_text()).substitute(lib_suffix=lib_suffix,
-                                                                                                 table_size=opts.ptr_size * (
-                                                                                                         len(funs) + 1)))
+            f.write(string.Template((self.templates_dir / "table.S.tpl").read_text()).substitute(lib_suffix=lib_suffix, table_size=opts.ptr_size * (len(funs) + 1)))
             tramp_tpl = string.Template((self.templates_dir / "trampoline.S.tpl").read_text())
-            f.writelines(
-                tramp_tpl.substitute(lib_suffix=lib_suffix, sym=opts.symbol_prefix + name, offset=i * opts.ptr_size,
-                                     number=i) for i, name in enumerate(funs))
+            for i, name in enumerate(funs):
+                f.write(tramp_tpl.substitute(lib_suffix=lib_suffix, sym=opts.symbol_prefix + name, offset=i * opts.ptr_size, number=i))
 
         if not opts.quiet: self.info(f"Generating {init_file}...")
         with open(os.path.join(outdir, init_file), "w") as f:
@@ -612,10 +608,16 @@ def main(argv: list[str] | None = None) -> int:
     info = info_printer(args.quiet)
 
     platform = args.platform or ("osx" if sys.platform == "darwin" else "linux")
-    backend_cls: Any = MachOBackend if platform == "osx" and MachOBackend(
-        args.library).matches() else ElfBackend if ElfBackend(
-        args.library).matches() else MachOBackend if platform == "osx" else ElfBackend
-    backend = backend_cls(args.library)
+
+    m_backend = MachOBackend(args.library)
+    e_backend = ElfBackend(args.library)
+
+    if m_backend.matches():
+        backend = m_backend
+    elif e_backend.matches():
+        backend = e_backend
+    else:
+        backend = m_backend if platform in ("osx", "darwin") else e_backend
 
     platform_root = Path(__file__).resolve().parent / "arch" / platform
     arch = normalize_arch(args.target)
@@ -636,15 +638,17 @@ def main(argv: list[str] | None = None) -> int:
         args.dlsym_callback, int(cfg["Arch"]["PointerSize"]), set(re.split(r"\s*,\s*", cfg["Arch"]["SymbolReloc"]))
     )
 
-    Generator(backend, templates_dir=str(platform_root / arch), common_templates_dir=str(platform_root / "common"),
-              info=info).run(
+    funs_allowlist = None
+    if args.symbol_list:
+        with open(args.symbol_list, "r") as f:
+            funs_allowlist = [line for l in f if (line := re.sub(r"#.*", "", l).strip())]
+
+    Generator(backend, templates_dir=str(platform_root / arch), common_templates_dir=str(platform_root / "common"), info=info).run(
         input_path=args.library, outdir=args.outdir, stem=stem,
         load_name=args.library_load_name or backend.default_load_name(),
-        funs_allowlist=[line for l in open(args.symbol_list).read().splitlines() if
-                        (line := re.sub(r"#.*", "", l).strip())] if args.symbol_list else None, opts=opts
+        funs_allowlist=funs_allowlist, opts=opts
     )
     return 0
-
 
 if __name__ == "__main__":
     set_me_from_argv0(sys.argv[0])

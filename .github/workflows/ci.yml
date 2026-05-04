@@ -6,6 +6,7 @@ on:
   push:
     branches:
     - master
+    - add-osx-support
     paths-ignore:
     - 'LICENSE.txt'
     - '**.md'

@@ -49,7 +49,7 @@ for ADD_CFLAGS in '-no-pie' '-fPIE'; do
     # Build app
     $CC $CFLAGS $ADD_CFLAGS main.c test.c libinterposed.so.tramp.S libinterposed.so.init.c $LIBS
 
-    LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} $INTERP ./a.out > a.out.log
+    LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-} $INTERP ./a.out > a.out.log
     diff test.ref a.out.log
   done
 done
@@ -68,7 +68,7 @@ for ADD_GFLAGS in '' '--no-lazy-load'; do
   # Build app
   $CC $CFLAGS $ADD_CFLAGS main.c shlib.so
 
-  LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} $INTERP ./a.out > a.out.log
+  LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-} $INTERP ./a.out > a.out.log
   diff test.ref a.out.log
 done
 

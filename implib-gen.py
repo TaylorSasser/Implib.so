@@ -42,6 +42,10 @@ def info_printer(quiet: bool) -> Callable[[str], None]:
 
 
 MAGIC_ELF: bytes = b"\x7fELF"
+MAGIC_MACHO: frozenset[bytes] = frozenset({
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+})
 
 
 @dataclass(slots=True)
@@ -169,7 +173,13 @@ class BinaryBackend(ABC):
                 if parsed is None:
                     raise BackendError(f"LIEF failed to parse '{self.path}'")
 
-                self._bin = parsed
+                if isinstance(parsed, lief.MachO.FatBinary):
+                    cpu = lief.MachO.Header.CPU_TYPE.ARM64
+                    self._bin = parsed.take(cpu)
+                    if self._bin is None:
+                        raise BackendError(f"Mach-O FatBinary '{self.path}' does not contain an ARM64 slice.")
+                else:
+                    self._bin = parsed
             except Exception as e:
                 error(str(e) if isinstance(e, BackendError) else f"LIEF failed to parse '{self.path}': {e}")
         return self._bin
@@ -346,6 +356,127 @@ class ElfBackend(BinaryBackend):
 
     def byteorder(self) -> str:
         return "little" if not self.binary or self.binary.header.identity_data == lief.ELF.Header.ELF_DATA.LSB else "big"
+
+
+class MachOBackend(BinaryBackend):
+    format_name: str = "macho"
+
+    @property
+    def binary(self) -> lief.MachO.Binary | None:
+        return super().binary
+
+    def matches(self) -> bool:
+        return self.magic in MAGIC_MACHO
+
+    def default_load_name(self) -> str:
+        if self.binary:
+            try:
+                if cmd := self.binary.get(lief.MachO.LoadCommand.TYPE.ID_DYLIB):
+                    return os.path.basename(cmd.name)
+            except Exception:
+                pass
+        return os.path.basename(self.path)
+
+    def collect_symbols(self) -> list[Symbol]:
+        if not self.binary:
+            return []
+
+        func_addrs = {f.address for f in self.binary.functions if f.size > 0}
+        by_name: dict[str, Symbol] = {}
+
+        for sym in self.binary.symbols:
+            if not sym.name or sym.category == lief.MachO.Symbol.CATEGORY.NONE:
+                continue
+
+            name = sym.name[1:] if sym.name.startswith("_") else sym.name
+            val, size = sym.value, sym.size
+
+            try:
+                sec = self.binary.section_from_virtual_address(val)
+            except Exception:
+                sec = None
+
+            typ, bind, ndx, default = "OBJECT", "LOCAL", "0", True
+            is_func = val in func_addrs
+
+            if sec and not is_func:
+                flags = lief.MachO.Section.FLAGS
+                is_code = sec.has(flags.SOME_INSTRUCTIONS) or sec.has(flags.PURE_INSTRUCTIONS)
+                is_stub = sec.type == lief.MachO.Section.TYPE.SYMBOL_STUBS
+
+                # Check execution segment safely depending on LIEF version
+                is_exec = False
+                if sec.has_segment and sec.segment:
+                    try:
+                        is_exec = bool(sec.segment.init_protection & lief.MachO.SegmentCommand.VM_PROTECTIONS.X.value)
+                    except AttributeError:
+                        is_exec = bool(sec.segment.init_protection & lief.MachO.SegmentCommand.VM_PROTECTIONS.X)
+
+                if is_code or is_stub or is_exec:
+                    is_func = True
+
+            if is_func:
+                typ = "FUNC"
+
+            if sym.category == lief.MachO.Symbol.CATEGORY.UNDEFINED:
+                ndx = "UND"
+                bind = "WEAK" if sym.has_binding_info and sym.binding_info.weak_import else "GLOBAL"
+            elif sym.category == lief.MachO.Symbol.CATEGORY.EXTERNAL:
+                bind = "GLOBAL"
+                if sym.has_export_info and sym.export_info:
+                    flags = sym.export_info.flags_list
+                    if lief.MachO.ExportInfo.FLAGS.WEAK_DEFINITION in flags:
+                        bind = "WEAK"
+                    if lief.MachO.ExportInfo.FLAGS.REEXPORT in flags:
+                        typ = "FUNC"
+                else:
+                    default = False
+
+            s_obj = Symbol(
+                name, bind, typ, ndx, val,
+                self._get_exact_size(val, size), default, None,
+                demangled=sym.demangled_name or name
+            )
+
+            existing = by_name.get(name)
+            if not existing or s_obj.score > existing.score:
+                by_name[name] = s_obj
+
+        if not by_name:
+            error(f"failed to analyze symbols in {self.path}")
+        return list(by_name.values())
+
+    def supports_vtables(self) -> bool:
+        return True
+
+    def collect_sections(self) -> list[SectionInfo]:
+        if not self.binary:
+            return []
+        return [
+            SectionInfo(
+                s.name, s.virtual_address, s.offset, s.size,
+                "ALLOC" if s.has_segment and s.segment.name != "__PAGEZERO" else ""
+            ) for s in self.binary.sections
+        ]
+
+    def collect_relocations(self) -> list[RelocationInfo]:
+        rels: list[RelocationInfo] = []
+        if not self.binary:
+            return rels
+
+        for rel in self.binary.relocations:
+            sym_name = rel.symbol.name if rel.has_symbol and rel.symbol else ""
+            if sym_name.startswith("_"):
+                sym_name = sym_name[1:]
+            rels.append(RelocationInfo(rel.address, 0, "SYMBOLIC" if sym_name else "RELATIVE", (sym_name, 0)))
+
+        for b in self.binary.bindings:
+            sym_name = b.symbol.name if b.has_symbol and b.symbol else ""
+            if sym_name.startswith("_"):
+                sym_name = sym_name[1:]
+            rels.append(RelocationInfo(b.address, 0, "SYMBOLIC", (sym_name, b.addend)))
+
+        return rels
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,6 +720,7 @@ def normalize_arch(raw: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("library")
+    p.add_argument("--platform", choices=["linux", "osx"], default=None)
     p.add_argument("--target", default=os.uname().machine)
     p.add_argument("--outdir", "-o", default="./")
     p.add_argument("--symbol-list")
@@ -609,8 +741,18 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     info = info_printer(args.quiet)
 
-    backend: BinaryBackend = ElfBackend(args.library)
-    platform_root = Path(__file__).resolve().parent / "arch" / "linux"
+    platform = args.platform or ("osx" if sys.platform == "darwin" else "linux")
+    m_backend = MachOBackend(args.library)
+    e_backend = ElfBackend(args.library)
+
+    if m_backend.matches():
+        backend: BinaryBackend = m_backend
+    elif e_backend.matches():
+        backend = e_backend
+    else:
+        backend = m_backend if args.platform == "osx" else e_backend
+
+    platform_root = Path(__file__).resolve().parent / "arch" / platform
     arch = normalize_arch(args.target)
     backend.set_arch(arch)
 

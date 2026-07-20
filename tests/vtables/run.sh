@@ -19,7 +19,7 @@ fi
 
 . ../common.sh
 
-export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-}
 
 $CXX $CFLAGS -shared -fPIC interposed.cpp -o libinterposed.so
 $CXX $CFLAGS main.cpp -L. -linterposed

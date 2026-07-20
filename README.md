@@ -147,7 +147,6 @@ The tool does not transparently support all features of POSIX shared libraries. 
 The tool also lacks the following important features:
 * symbol versions are not handled at all
 * keep fast paths of shims together to reduce I$ pressure
-* support for macOS
 
 Finally, there are some minor TODOs in code.
 

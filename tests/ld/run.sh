@@ -19,7 +19,7 @@ fi
 
 . ../common.sh
 
-export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=.:${LD_LIBRARY_PATH:-} DYLD_LIBRARY_PATH=.:${DYLD_LIBRARY_PATH:-}
 
 $CC $CFLAGS -shared -fPIC interposed.c -o libinterposed.so
 $CC $CFLAGS main.c -L. -linterposed
@@ -33,9 +33,16 @@ if $CC --version | grep -qE 'clang|^lcc'; then
   CFLAGS="$CFLAGS -B."
 fi
 PATH=.:../..:$PATH $CC $CFLAGS -Wno-deprecated main.c -L. -linterposed
-if readelf -d a.out | grep -q libinterposed; then
-  echo "Linker wrapper failed to wrap library"
-  exit 1
+if uname | grep -q Darwin; then
+  if otool -L a.out | grep -q libinterposed; then
+    echo "Linker wrapper failed to wrap library"
+    exit 1
+  fi
+else
+  if readelf -d a.out | grep -q libinterposed; then
+    echo "Linker wrapper failed to wrap library"
+    exit 1
+  fi
 fi
 $INTERP ./a.out 2>&1 | tee new.log
 

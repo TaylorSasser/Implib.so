@@ -535,7 +535,7 @@ Examples:
 
   # Collect target info
 
-  target_dir = os.path.join(root, 'arch', target)
+  target_dir = os.path.join(root, 'arch', 'linux', target)
 
   if not os.path.exists(target_dir):
     error(f"unknown architecture '{target}'")
@@ -693,7 +693,7 @@ Examples:
   with open(os.path.join(outdir, init_file), 'w') as f:
     if not quiet:
       print(f"Generating {init_file}...")
-    with open(os.path.join(root, 'arch/common/init.c.tpl'), 'r') as t:
+    with open(os.path.join(root, 'arch/linux/common/init.c.tpl'), 'r') as t:
       if funs:
         sym_names = ',\n  '.join(f'"{name}"' for name in funs) + ','
       else:
